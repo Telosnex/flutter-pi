@@ -188,6 +188,13 @@ struct flutterpi {
     struct compositor *compositor;
 
     /**
+	 * @brief The frame scheduler. Paces flutter frame production off actual
+	 * KMS page flips and manages the presentation queue.
+	 *
+	 */
+    struct frame_scheduler *frame_scheduler;
+
+    /**
 	 * @brief Event source which represents the compositor event fd as registered to the
 	 * event loop.
 	 *
@@ -493,44 +500,10 @@ static int on_deferred_begin_frame(void *userdata) {
     return 0;
 }
 
-UNUSED static void on_begin_frame(void *userdata, uint64_t vblank_ns, uint64_t next_vblank_ns) {
-    FlutterEngineResult engine_result;
-    struct frame_req *req;
-    int ok;
-
-    ASSERT_NOT_NULL(userdata);
-    req = userdata;
-
-    if (flutterpi_runs_platform_tasks_on_current_thread(req->flutterpi)) {
-        TRACER_INSTANT(req->flutterpi->tracer, "FlutterEngineOnVsync");
-
-        engine_result = req->flutterpi->flutter.procs.OnVsync(req->flutterpi->flutter.engine, req->baton, vblank_ns, next_vblank_ns);
-        if (engine_result != kSuccess) {
-            LOG_ERROR("Couldn't signal frame begin to flutter engine. FlutterEngineOnVsync: %s\n", FLUTTER_RESULT_TO_STRING(engine_result));
-            goto fail_free_req;
-        }
-
-        free(req);
-    } else {
-        req->vblank_ns = vblank_ns;
-        req->next_vblank_ns = next_vblank_ns;
-        ok = flutterpi_post_platform_task(on_deferred_begin_frame, req);
-        if (ok != 0) {
-            LOG_ERROR("Couldn't defer signalling frame begin.\n");
-            goto fail_free_req;
-        }
-    }
-
-    return;
-
-fail_free_req:
-    free(req);
-    return;
-}
-
-/// Called on some flutter internal thread to request a frame,
-/// and also get the vblank timestamp of the pageflip preceding that frame.
-UNUSED static void on_frame_request(void *userdata, intptr_t baton) {
+/// Called by the frame scheduler when a flutter vsync request should be
+/// replied to. Might be called on any thread; FlutterEngineOnVsync must be
+/// called on the platform task thread, so this rethreads if necessary.
+static void on_scheduler_vsync_reply(void *userdata, intptr_t baton, uint64_t frame_start_time_nanos, uint64_t next_frame_start_time_nanos) {
     FlutterEngineResult engine_result;
     struct flutterpi *flutterpi;
     struct frame_req *req;
@@ -539,7 +512,17 @@ UNUSED static void on_frame_request(void *userdata, intptr_t baton) {
     ASSERT_NOT_NULL(userdata);
     flutterpi = userdata;
 
-    TRACER_INSTANT(flutterpi->tracer, "on_frame_request");
+    if (flutterpi_runs_platform_tasks_on_current_thread(flutterpi)) {
+        TRACER_INSTANT(flutterpi->tracer, "FlutterEngineOnVsync");
+
+        engine_result =
+            flutterpi->flutter.procs.OnVsync(flutterpi->flutter.engine, baton, frame_start_time_nanos, next_frame_start_time_nanos);
+        if (engine_result != kSuccess) {
+            LOG_ERROR("Couldn't signal frame begin to flutter engine. FlutterEngineOnVsync: %s\n", FLUTTER_RESULT_TO_STRING(engine_result));
+        }
+
+        return;
+    }
 
     req = malloc(sizeof *req);
     if (req == NULL) {
@@ -549,32 +532,28 @@ UNUSED static void on_frame_request(void *userdata, intptr_t baton) {
 
     req->flutterpi = flutterpi;
     req->baton = baton;
-    req->vblank_ns = get_monotonic_time();
-    req->next_vblank_ns = req->vblank_ns + (1000000000.0 / compositor_get_refresh_rate(flutterpi->compositor));
+    req->vblank_ns = frame_start_time_nanos;
+    req->next_vblank_ns = next_frame_start_time_nanos;
 
-    if (flutterpi_runs_platform_tasks_on_current_thread(req->flutterpi)) {
-        TRACER_INSTANT(req->flutterpi->tracer, "FlutterEngineOnVsync");
-
-        engine_result =
-            req->flutterpi->flutter.procs.OnVsync(req->flutterpi->flutter.engine, req->baton, req->vblank_ns, req->next_vblank_ns);
-        if (engine_result != kSuccess) {
-            LOG_ERROR("Couldn't signal frame begin to flutter engine. FlutterEngineOnVsync: %s\n", FLUTTER_RESULT_TO_STRING(engine_result));
-            goto fail_free_req;
-        }
-
+    ok = flutterpi_post_platform_task(on_deferred_begin_frame, req);
+    if (ok != 0) {
+        LOG_ERROR("Couldn't defer signalling frame begin.\n");
         free(req);
-    } else {
-        ok = flutterpi_post_platform_task(on_deferred_begin_frame, req);
-        if (ok != 0) {
-            LOG_ERROR("Couldn't defer signalling frame begin.\n");
-            goto fail_free_req;
-        }
     }
+}
 
-    return;
+/// Called on some flutter internal thread to request a frame.
+/// The frame scheduler will reply (possibly deferred to the next KMS page
+/// flip) via on_scheduler_vsync_reply.
+static void on_frame_request(void *userdata, intptr_t baton) {
+    struct flutterpi *flutterpi;
 
-fail_free_req:
-    free(req);
+    ASSERT_NOT_NULL(userdata);
+    flutterpi = userdata;
+
+    TRACER_INSTANT(flutterpi->tracer, "on_frame_request");
+
+    frame_scheduler_on_fl_vsync_request(flutterpi->frame_scheduler, baton);
 }
 
 UNUSED static FlutterTransformation on_get_transformation(void *userdata) {
@@ -1380,7 +1359,11 @@ static FlutterEngine create_flutter_engine(
     project_args.update_semantics_custom_action_callback = NULL;
     project_args.persistent_cache_path = paths->asset_bundle_path;
     project_args.is_persistent_cache_read_only = false;
-    project_args.vsync_callback = NULL;  // on_frame_request, /* broken since 2.2, kinda *
+    // Pace frame production off actual KMS page flips, unless frame requests
+    // are disabled (dummy displays don't produce page flips; and
+    // FLUTTERPI_NO_FRAME_REQUESTS=1 can be used as a diagnostic control, in
+    // which case the engine falls back to its internal vsync timer).
+    project_args.vsync_callback = frame_scheduler_uses_frame_requests(flutterpi->frame_scheduler) ? on_frame_request : NULL;
     project_args.custom_dart_entrypoint = NULL;
     project_args.custom_task_runners = &custom_task_runners;
     project_args.shutdown_dart_vm_when_done = true;
@@ -2518,7 +2501,25 @@ struct flutterpi *flutterpi_new_from_args(int argc, char **argv) {
         goto fail_destroy_drmdev;
     }
 
-    scheduler = frame_scheduler_new(false, kDoubleBufferedVsync_PresentMode, NULL, NULL);
+    // Pace flutter frame production off actual KMS page flips, except for
+    // dummy displays (which never produce page flips).
+    // FLUTTERPI_NO_FRAME_REQUESTS=1 restores the previous behavior (engine
+    // paces itself with an internal timer) as a diagnostic control.
+    bool uses_frame_requests = !cmd_args.dummy_display;
+    {
+        const char *no_frame_requests_env = getenv("FLUTTERPI_NO_FRAME_REQUESTS");
+        if (no_frame_requests_env != NULL && atoi(no_frame_requests_env) != 0) {
+            LOG_DEBUG("Frame requests are disabled (FLUTTERPI_NO_FRAME_REQUESTS). The engine will pace itself using a timer.\n");
+            uses_frame_requests = false;
+        }
+    }
+
+    scheduler = frame_scheduler_new(
+        uses_frame_requests,
+        kDoubleBufferedVsync_PresentMode,
+        uses_frame_requests ? on_scheduler_vsync_reply : NULL,
+        fpi
+    );
     if (scheduler == NULL) {
         LOG_ERROR("Couldn't create frame scheduler.\n");
         goto fail_unref_tracer;
@@ -2744,8 +2745,7 @@ struct flutterpi *flutterpi_new_from_args(int argc, char **argv) {
         }
     }
 
-    // We don't need these anymore.
-    frame_scheduler_unref(scheduler);
+    // We don't need this anymore.
     window_unref(window);
 
     pthread_mutex_init(&fpi->event_loop_mutex, get_default_mutex_attrs());
@@ -2757,6 +2757,7 @@ struct flutterpi *flutterpi_new_from_args(int argc, char **argv) {
     fpi->locales = locales;
     fpi->tracer = tracer;
     fpi->compositor = compositor;
+    fpi->frame_scheduler = scheduler;
     fpi->gl_renderer = gl_renderer;
     fpi->vk_renderer = vk_renderer;
     fpi->user_input = input;
@@ -2863,6 +2864,7 @@ void flutterpi_destroy(struct flutterpi *flutterpi) {
     unload_flutter_engine_lib(flutterpi->flutter.engine_handle);
     user_input_destroy(flutterpi->user_input);
     compositor_unref(flutterpi->compositor);
+    frame_scheduler_unref(flutterpi->frame_scheduler);
     if (flutterpi->gl_renderer) {
 #ifdef HAVE_EGL_GLES2
         gl_renderer_unref(flutterpi->gl_renderer);
