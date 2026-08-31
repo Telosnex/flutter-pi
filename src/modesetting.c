@@ -121,6 +121,30 @@ struct drmdev {
         struct kms_req *last_flipped;
     } per_crtc_state[32];
 
+    /**
+     * @brief Page-flip completions that were observed while the drmdev lock was
+     * held and that still need to be dispatched to the outside world.
+     *
+     * Scanout callbacks and kms_req release callbacks can do non-trivial work
+     * (e.g. release GBM buffers, schedule the next frame and do another atomic
+     * commit), so they must not be invoked with the drmdev lock held.
+     * @ref drmdev_on_page_flip_locked only records the completion here,
+     * @ref drmdev_dispatch_page_flips delivers them once the lock is dropped.
+     *
+     * Guarded by @ref mutex.
+     */
+    struct {
+        kms_scanout_cb_t scanout_callback;
+        void *userdata;
+        uint64_t vblank_ns;
+
+        /// The kms_req that was previously scanned out on this CRTC and was
+        /// just replaced (retired) by this page-flip. Unreffing it will invoke
+        /// the release callbacks of its layers, making their buffers reusable.
+        struct kms_req *retired_req;
+    } pending_flip_dispatches[16];
+    size_t n_pending_flip_dispatches;
+
     int master_fd;
     void *master_fd_metadata;
 
@@ -1138,6 +1162,7 @@ struct drmdev *drmdev_new_from_interface_fd(int fd, void *fd_metadata, const str
     }
 
     pthread_mutex_init(&drmdev->mutex, get_default_mutex_attrs());
+    drmdev->n_pending_flip_dispatches = 0;
     drmdev->n_refs = REFCOUNT_INIT_1;
     drmdev->fd = fd;
     drmdev->supports_atomic_modesetting = supports_atomic_modesetting;
@@ -1356,25 +1381,98 @@ drmdev_on_page_flip_locked(int fd, unsigned int sequence, unsigned int tv_sec, u
 
     ASSERT_NOT_NULL_MSG(crtc, "Invalid CRTC id");
 
-    if (drmdev->per_crtc_state[crtc->index].scanout_callback != NULL) {
-        uint64_t vblank_ns = tv_sec * 1000000000ull + tv_usec * 1000ull;
-        drmdev->per_crtc_state[crtc->index].scanout_callback(drmdev, vblank_ns, drmdev->per_crtc_state[crtc->index].userdata);
+    // Don't dispatch the scanout callback or release the retired kms_req while
+    // the drmdev lock is held: both can do non-trivial work, e.g. immediately
+    // commit the next queued frame (which acquires the drmdev lock again) or
+    // release GBM buffers. Just record the completion here; it's delivered by
+    // @ref drmdev_dispatch_page_flips once the lock is dropped.
+    ASSERT_MSG(
+        drmdev->n_pending_flip_dispatches < ARRAY_SIZE(drmdev->pending_flip_dispatches),
+        "Too many undispatched page-flip events."
+    );
+    if (drmdev->n_pending_flip_dispatches >= ARRAY_SIZE(drmdev->pending_flip_dispatches)) {
+        // Should be impossible (at most one flip per CRTC can be pending, and
+        // dispatches are drained right after every event-handling pass), but
+        // never scribble past the queue in release builds. Leaking the retired
+        // request is the least bad option here.
+        LOG_ERROR("Too many undispatched page-flip events. This is a flutter-pi bug.\n");
+        return;
+    }
+
+    {
+        unsigned index = drmdev->n_pending_flip_dispatches++;
+        drmdev->pending_flip_dispatches[index].scanout_callback = drmdev->per_crtc_state[crtc->index].scanout_callback;
+        drmdev->pending_flip_dispatches[index].userdata = drmdev->per_crtc_state[crtc->index].userdata;
+        drmdev->pending_flip_dispatches[index].vblank_ns = tv_sec * 1000000000ull + tv_usec * 1000ull;
 
         // clear the scanout callback
         drmdev->per_crtc_state[crtc->index].scanout_callback = NULL;
         drmdev->per_crtc_state[crtc->index].destroy_callback = NULL;
         drmdev->per_crtc_state[crtc->index].userdata = NULL;
-    }
 
-    last_flipped = &drmdev->per_crtc_state[crtc->index].last_flipped;
-    if (*last_flipped != NULL) {
-        /// TODO: Remove this if we ever cache KMS reqs.
-        /// FIXME: This will fail if we're using blocking commits.
-        // assert(refcount_is_one(&((struct kms_req_builder*) *last_flipped)->n_refs));
-    }
+        last_flipped = &drmdev->per_crtc_state[crtc->index].last_flipped;
+        if (*last_flipped != NULL) {
+            /// TODO: Remove this if we ever cache KMS reqs.
+            /// FIXME: This will fail if we're using blocking commits.
+            // assert(refcount_is_one(&((struct kms_req_builder*) *last_flipped)->n_refs));
+        }
 
-    kms_req_swap_ptrs(last_flipped, req);
-    kms_req_unref(req);
+        // The kms_req that was just scanned out replaces the previously
+        // scanned-out one. We take over the reference held by the page-flip
+        // event and defer releasing the retired request.
+        drmdev->pending_flip_dispatches[index].retired_req = *last_flipped;
+        *last_flipped = req;
+    }
+}
+
+/**
+ * @brief Deliver page-flip completions recorded by @ref drmdev_on_page_flip_locked.
+ *
+ * Must be called *without* the drmdev lock held. For each completion, the
+ * retired kms_req is released first (invoking the layer release callbacks, so
+ * the retired buffers are reusable), then the scanout callback is invoked.
+ * That order matters: the scanout callback might immediately kick off the
+ * next frame, which needs the retired buffers to be back in the pool.
+ */
+static void drmdev_dispatch_page_flips(struct drmdev *drmdev) {
+    ASSERT_NOT_NULL(drmdev);
+
+    for (;;) {
+        kms_scanout_cb_t scanout_callback;
+        struct kms_req *retired_req;
+        uint64_t vblank_ns;
+        void *userdata;
+
+        drmdev_lock(drmdev);
+
+        if (drmdev->n_pending_flip_dispatches == 0) {
+            drmdev_unlock(drmdev);
+            break;
+        }
+
+        // Pop the first pending dispatch. (FIFO to preserve flip ordering.)
+        scanout_callback = drmdev->pending_flip_dispatches[0].scanout_callback;
+        userdata = drmdev->pending_flip_dispatches[0].userdata;
+        vblank_ns = drmdev->pending_flip_dispatches[0].vblank_ns;
+        retired_req = drmdev->pending_flip_dispatches[0].retired_req;
+
+        drmdev->n_pending_flip_dispatches--;
+        memmove(
+            drmdev->pending_flip_dispatches,
+            drmdev->pending_flip_dispatches + 1,
+            drmdev->n_pending_flip_dispatches * sizeof *drmdev->pending_flip_dispatches
+        );
+
+        drmdev_unlock(drmdev);
+
+        if (retired_req != NULL) {
+            kms_req_unref(retired_req);
+        }
+
+        if (scanout_callback != NULL) {
+            scanout_callback(drmdev, vblank_ns, userdata);
+        }
+    }
 }
 
 static int drmdev_on_modesetting_fd_ready_locked(struct drmdev *drmdev) {
@@ -1430,10 +1528,13 @@ int drmdev_on_event_fd_ready(struct drmdev *drmdev) {
 
     drmdev_unlock(drmdev);
 
+    drmdev_dispatch_page_flips(drmdev);
+
     return 0;
 
 fail_unlock:
     drmdev_unlock(drmdev);
+    drmdev_dispatch_page_flips(drmdev);
     return ok;
 }
 
@@ -3042,6 +3143,10 @@ kms_req_commit_common(struct kms_req *req, bool blocking, kms_scanout_cb_t scano
     }
 
     drmdev_unlock(builder->drmdev);
+
+    // If this was a blocking commit, the page-flip event was already read and
+    // recorded synchronously above; deliver it now that the lock is dropped.
+    drmdev_dispatch_page_flips(builder->drmdev);
 
     return 0;
 
