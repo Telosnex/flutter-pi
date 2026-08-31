@@ -296,9 +296,26 @@ static void fill_platform_view_layer_props(
 
     rotation = fmod(rotation, 360.0);
 
-    /// TODO: Implement axis aligned rectangle detection
-    props_out->is_aa_rect = false;
-    props_out->aa_rect = AA_RECT_FROM_COORDS(0, 0, 0, 0);
+    // A quad is axis-aligned when its left and right edges are vertical and its
+    // top and bottom edges are horizontal. Epsilon because these coordinates come
+    // out of float matrix math and exact equality does not survive a device pixel
+    // ratio multiply.
+    //
+    // Upstream left this as a TODO and zeroed the rect unconditionally, which
+    // hands every platform view a 0x0 destination: the surface scans out a valid
+    // buffer into nothing. Always pass the bounding rect - for a genuinely
+    // rotated view it is still a much better destination than zero.
+    {
+        const double eps = 0.01;
+        bool left_edge_vertical = fabs(quad.top_left.x - quad.bottom_left.x) < eps;
+        bool right_edge_vertical = fabs(quad.top_right.x - quad.bottom_right.x) < eps;
+        bool top_edge_horizontal = fabs(quad.top_left.y - quad.top_right.y) < eps;
+        bool bottom_edge_horizontal = fabs(quad.bottom_left.y - quad.bottom_right.y) < eps;
+
+        props_out->is_aa_rect = left_edge_vertical && right_edge_vertical && top_edge_horizontal &&
+                                bottom_edge_horizontal;
+        props_out->aa_rect = quad_get_aa_bounding_rect(quad);
+    }
     props_out->quad = quad;
     props_out->opacity = opacity;
     props_out->rotation = rotation;
@@ -322,6 +339,7 @@ static int compositor_push_fl_layers(struct compositor *compositor, size_t n_fl_
     for (int i = 0; i < n_fl_layers; i++) {
         const FlutterLayer *fl_layer = fl_layers[i];
         struct fl_layer *layer = fl_layer_composition_peek_layer(composition, i);
+
 
         if (fl_layer->type == kFlutterLayerContentTypeBackingStore) {
             /// TODO: Implement
