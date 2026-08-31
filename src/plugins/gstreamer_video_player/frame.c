@@ -32,18 +32,19 @@
 /// it works under Vulkan, which is the point.
 ///
 /// Returns 0 and fills @dmabuf_out (which owns fds[0]) on success, else errno.
-UNUSED static int dup_gst_frame_as_scanout_dmabuf(
+static int dup_gst_frame_as_scanout_dmabuf(
     struct gbm_device *gbm_device,
     GstBuffer *buffer,
     uint32_t width,
     uint32_t height,
     enum pixfmt format,
     uint32_t gbm_format,
+    uint32_t src_stride,
     struct dmabuf *dmabuf_out
 ) {
     GstMapInfo map_info;
     struct gbm_bo *bo;
-    uint32_t dst_stride, src_stride, row_bytes;
+    uint32_t dst_stride, row_bytes;
     void *map, *map_data;
     int fd, ok;
 
@@ -52,8 +53,22 @@ UNUSED static int dup_gst_frame_as_scanout_dmabuf(
         return EIO;
     }
 
-    if (height == 0 || map_info.size < (size_t) height) {
-        LOG_ERROR("Frame buffer too small for %u rows.\n", (unsigned) height);
+    if (height == 0 || src_stride == 0) {
+        LOG_ERROR("Frame has no usable geometry (%ux%u, stride %u).\n", (unsigned) width, (unsigned) height, (unsigned) src_stride);
+        ok = EINVAL;
+        goto fail_unmap_buffer;
+    }
+
+    // Never derive the stride from the buffer size: gstreamer buffers may carry
+    // padding, and reading (size/height) rows walks off the end of the mapping
+    // and takes a SIGBUS on the last row.
+    if ((size_t) src_stride * (size_t) height > map_info.size) {
+        LOG_ERROR(
+            "Frame buffer is %zu bytes, too small for %u rows of stride %u.\n",
+            map_info.size,
+            (unsigned) height,
+            (unsigned) src_stride
+        );
         ok = EINVAL;
         goto fail_unmap_buffer;
     }
@@ -74,10 +89,8 @@ UNUSED static int dup_gst_frame_as_scanout_dmabuf(
         goto fail_destroy_bo;
     }
 
-    // Unlike the texture path, destination padding is fine here: a scanout BO
-    // carries its own stride, so copy row by row rather than demanding that the
-    // strides match exactly.
-    src_stride = (uint32_t) (map_info.size / height);
+    // Destination padding is fine: a scanout BO carries its own stride, so copy
+    // row by row rather than demanding that source and destination strides match.
     row_bytes = src_stride < dst_stride ? src_stride : dst_stride;
 
     for (uint32_t y = 0; y < height; y++) {
@@ -103,7 +116,12 @@ UNUSED static int dup_gst_frame_as_scanout_dmabuf(
     dmabuf_out->strides[0] = (int) dst_stride;
     dmabuf_out->has_modifiers = false;
 
-    gbm_bo_destroy(bo);
+    // Do NOT destroy the BO on the success path. Export + re-import on the same
+    // DRM fd is a self-import: drmPrimeFDToHandle returns the cached original GEM
+    // handle, so destroying the BO would close the handle drmModeAddFB2 needs.
+    // The release callback destroys it once the buffer is no longer scanned out.
+    dmabuf_out->userdata = bo;
+
     gst_buffer_unmap(buffer, &map_info);
     return 0;
 
@@ -113,6 +131,42 @@ fail_destroy_bo:
 fail_unmap_buffer:
     gst_buffer_unmap(buffer, &map_info);
     return ok;
+}
+
+int frame_dup_sample_as_scanout_dmabuf(struct gbm_device *gbm_device, GstSample *sample, struct dmabuf *dmabuf_out) {
+    GstVideoInfo info;
+    GstVideoMeta *meta;
+    GstBuffer *buffer;
+    GstCaps *caps;
+    uint32_t src_stride;
+
+    caps = gst_sample_get_caps(sample);
+    if (caps == NULL || !gst_video_info_from_caps(&info, caps)) {
+        LOG_ERROR("Frame sample has no usable caps; cannot build a scanout buffer.\n");
+        return EINVAL;
+    }
+
+    buffer = gst_sample_get_buffer(sample);
+    if (buffer == NULL) {
+        return EINVAL;
+    }
+
+    // The per-buffer video meta is authoritative when present; caps-derived info
+    // is only a fallback, and the two disagree exactly when padding is involved.
+    meta = gst_buffer_get_video_meta(buffer);
+    src_stride = meta != NULL ? (uint32_t) meta->stride[0] : (uint32_t) GST_VIDEO_INFO_PLANE_STRIDE(&info, 0);
+
+    // WPE hands us packed BGRA/BGRx; both scan out as ARGB8888 on little endian.
+    return dup_gst_frame_as_scanout_dmabuf(
+        gbm_device,
+        buffer,
+        (uint32_t) GST_VIDEO_INFO_WIDTH(&info),
+        (uint32_t) GST_VIDEO_INFO_HEIGHT(&info),
+        PIXFMT_ARGB8888,
+        GBM_FORMAT_ARGB8888,
+        src_stride,
+        dmabuf_out
+    );
 }
 
 

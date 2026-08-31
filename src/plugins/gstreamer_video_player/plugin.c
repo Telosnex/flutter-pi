@@ -749,7 +749,15 @@ invalid_format_hint:
         goto fail_remove_receiver;
     }
 
-    return platch_respond_success_pigeon(responsehandle, &STDMAP1(STDSTRING("textureId"), STDINT64(gstplayer_get_texture_id(player))));
+    return platch_respond_success_pigeon(
+        responsehandle,
+        &STDMAP2(
+            STDSTRING("textureId"),
+            STDINT64(gstplayer_get_texture_id(player)),
+            STDSTRING("platformViewId"),
+            STDINT64(gstplayer_get_platform_view_id(player))
+        )
+    );
 
 fail_remove_receiver:
     plugin_registry_remove_receiver(meta->event_channel_name);
@@ -1347,6 +1355,20 @@ invalid_headers:
     ok = gstplayer_initialize(player);
     if (ok != 0) {
         goto fail_remove_receiver;
+    }
+
+    // Only when the plane path is enabled do we widen the reply to a map; the
+    // product depends on the bare int, so the default shape must not change.
+    if (getenv("FLUTTERPI_WEBVIEW_ON_PLANE") != NULL) {
+        return platch_respond_success_std(
+            responsehandle,
+            &STDMAP2(
+                STDSTRING("textureId"),
+                STDINT64(gstplayer_get_texture_id(player)),
+                STDSTRING("platformViewId"),
+                STDINT64(gstplayer_get_platform_view_id(player))
+            )
+        );
     }
 
     return platch_respond_success_std(responsehandle, &STDINT64(gstplayer_get_texture_id(player)));

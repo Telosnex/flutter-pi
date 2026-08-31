@@ -122,6 +122,7 @@ void *gstplayer_get_userdata_locked(struct gstplayer *player);
 
 /// Get the id of the flutter external texture that this player is rendering into.
 int64_t gstplayer_get_texture_id(struct gstplayer *player);
+int64_t gstplayer_get_platform_view_id(struct gstplayer *player);
 
 //void gstplayer_set_info_callback(struct gstplayer *player, gstplayer_info_callback_t cb, void *userdata);
 
@@ -214,6 +215,10 @@ struct notifier *gstplayer_get_buffering_state_notifier(struct gstplayer *player
 ///
 /// Gets notified when an error happens. (Not yet implemented)
 struct notifier *gstplayer_get_error_notifier(struct gstplayer *player);
+
+struct dmabuf;
+struct gbm_device;
+int frame_dup_sample_as_scanout_dmabuf(struct gbm_device *gbm_device, GstSample *sample, struct dmabuf *dmabuf_out);
 
 struct video_frame;
 struct gl_renderer;

@@ -64,7 +64,11 @@ void refcounted_dmabuf_destroy(struct refcounted_dmabuf *dmabuf) {
     if (DRM_ID_IS_VALID(dmabuf->drm_fb_id)) {
         drmdev_rm_fb(dmabuf->drmdev, dmabuf->drm_fb_id);
     }
-    drmdev_unref(dmabuf->drmdev);
+    // A buffer pushed but never presented has no drmdev/fb yet: the fb is only
+    // created in present_kms(). Destroying it must not unref a NULL drmdev.
+    if (dmabuf->drmdev != NULL) {
+        drmdev_unref(dmabuf->drmdev);
+    }
     free(dmabuf);
 }
 
@@ -254,7 +258,14 @@ static int dmabuf_surface_present_kms(struct surface *_s, const struct fl_layer_
 
     surface_lock(_s);
 
-    ASSERT_NOT_NULL_MSG(s->next_buf, "dmabuf_surface_present_kms was called, but no dmabuf is queued to be presented.");
+    // Flutter presents the platform view as soon as the layer exists, which is
+    // before the first frame has been pushed. That is legitimate: there is simply
+    // nothing to scan out yet, so skip this frame rather than asserting (the
+    // assert compiles out in release builds and became a NULL deref).
+    if (s->next_buf == NULL) {
+        surface_unlock(_s);
+        return 0;
+    }
 
     if (DRM_ID_IS_VALID(s->next_buf->drm_fb_id)) {
         ASSERT_EQUALS_MSG(s->next_buf->drmdev, kms_req_builder_get_drmdev(builder), "Only 1 KMS instance per dmabuf supported right now.");

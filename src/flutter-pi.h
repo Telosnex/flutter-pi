@@ -86,6 +86,7 @@ enum flutter_runtime_mode { FLUTTER_RUNTIME_MODE_DEBUG, FLUTTER_RUNTIME_MODE_PRO
     ((runtime_mode) == FLUTTER_RUNTIME_MODE_PROFILE || (runtime_mode) == FLUTTER_RUNTIME_MODE_RELEASE)
 
 struct compositor;
+struct tracer;
 struct plugin_registry;
 struct texture_registry;
 struct drmdev;
@@ -186,6 +187,8 @@ const char *flutterpi_get_asset_bundle_path(struct flutterpi *flutterpi);
 void flutterpi_schedule_exit(struct flutterpi *flutterpi);
 
 struct gbm_device *flutterpi_get_gbm_device(struct flutterpi *flutterpi);
+struct compositor *flutterpi_get_compositor(struct flutterpi *flutterpi);
+struct tracer *flutterpi_get_tracer(struct flutterpi *flutterpi);
 
 bool flutterpi_has_gl_renderer(struct flutterpi *flutterpi);
 

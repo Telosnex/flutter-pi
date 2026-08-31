@@ -4,6 +4,9 @@
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
+#include "dmabuf_surface.h"
+#include "surface.h"
+#include "compositor_ng.h"
 
 #include <pthread.h>
 
@@ -26,6 +29,24 @@
 #include "texture_registry.h"
 #include "util/collection.h"
 #include "util/logging.h"
+
+static void on_release_plane_dmabuf(struct dmabuf *dmabuf) {
+    if (dmabuf == NULL) {
+        return;
+    }
+
+    // Frees in the reverse order of dup_gst_frame_as_scanout_dmabuf(): the BO
+    // outlives the fb because of the self-import handle cache (see frame.c).
+    if (dmabuf->userdata != NULL) {
+        gbm_bo_destroy((struct gbm_bo *) dmabuf->userdata);
+        dmabuf->userdata = NULL;
+    }
+
+    if (dmabuf->fds[0] >= 0) {
+        close(dmabuf->fds[0]);
+        dmabuf->fds[0] = -1;
+    }
+}
 
 #ifdef DEBUG
     #define DEBUG_TRACE_BEGIN(player, name) trace_begin(player, name)
@@ -155,6 +176,12 @@ struct gstplayer {
 
     struct texture *texture;
     int64_t texture_id;
+
+    /// Set when FLUTTERPI_WEBVIEW_ON_PLANE is in the environment: frames go to a
+    /// DRM overlay plane via this surface instead of being uploaded as a texture.
+    /// Renderer-agnostic, so it survives under Vulkan where external textures do not.
+    struct dmabuf_surface *dmabuf_surface;
+    int64_t platform_view_id;
 
     struct frame_interface *frame_interface;
 
@@ -1081,6 +1108,11 @@ static GstFlowReturn on_appsink_new_preroll(GstAppSink *appsink, void *userdata)
 
     player = userdata;
 
+    // Plane path: nothing to preroll, and frame_interface may be NULL.
+    if (((struct gstplayer *) userdata)->dmabuf_surface != NULL) {
+        return GST_FLOW_OK;
+    }
+
     sample = gst_app_sink_try_pull_preroll(appsink, 0);
     if (sample == NULL) {
         return GST_FLOW_FLUSHING;
@@ -1120,6 +1152,23 @@ static GstFlowReturn on_appsink_new_sample(GstAppSink *appsink, void *userdata) 
     if (sample == NULL) {
         return GST_FLOW_FLUSHING;
     }
+
+    if (player->dmabuf_surface != NULL) {
+        struct dmabuf dmabuf;
+        int ok;
+
+        ok = frame_dup_sample_as_scanout_dmabuf(flutterpi_get_gbm_device(player->flutterpi), sample, &dmabuf);
+        if (ok == 0) {
+            ok = dmabuf_surface_push_dmabuf(player->dmabuf_surface, &dmabuf, on_release_plane_dmabuf);
+            if (ok != 0) {
+                close(dmabuf.fds[0]);
+            }
+        }
+
+        gst_sample_unref(sample);
+        return GST_FLOW_OK;
+    }
+
 
     frame = frame_new(player->frame_interface, sample, player->has_gst_info ? &player->gst_info : NULL);
 
@@ -1250,13 +1299,20 @@ static int init(struct gstplayer *player, bool force_sw_decoders) {
     // configure our caps
     // we only accept video formats that we can actually upload to EGL
     GstCaps *caps = gst_caps_new_empty();
-    for_each_format_in_frame_interface(i, format, player->frame_interface) {
-        GstVideoFormat gst_format = gst_video_format_from_drm_format(format->format);
-        if (gst_format == GST_VIDEO_FORMAT_UNKNOWN) {
-            continue;
-        }
+    if (player->frame_interface == NULL) {
+        // Plane path: no EGL import, frames are copied into an ARGB8888
+        // scanout BO, so accept the packed 32-bit formats WPE produces.
+        gst_caps_append(caps, gst_caps_new_simple("video/x-raw", "format", G_TYPE_STRING, "BGRA", NULL));
+        gst_caps_append(caps, gst_caps_new_simple("video/x-raw", "format", G_TYPE_STRING, "BGRx", NULL));
+    } else {
+        for_each_format_in_frame_interface(i, format, player->frame_interface) {
+            GstVideoFormat gst_format = gst_video_format_from_drm_format(format->format);
+            if (gst_format == GST_VIDEO_FORMAT_UNKNOWN) {
+                continue;
+            }
 
-        gst_caps_append(caps, gst_caps_new_simple("video/x-raw", "format", G_TYPE_STRING, gst_video_format_to_string(gst_format), NULL));
+            gst_caps_append(caps, gst_caps_new_simple("video/x-raw", "format", G_TYPE_STRING, gst_video_format_to_string(gst_format), NULL));
+        }
     }
     gst_app_sink_set_caps(GST_APP_SINK(sink), caps);
     gst_caps_unref(caps);
@@ -1375,8 +1431,11 @@ static struct gstplayer *gstplayer_new(struct flutterpi *flutterpi, const char *
     if (texture == NULL)
         goto fail_free_player;
 
+    // The plane path scans dmabufs out via KMS and never touches GL, so a missing
+    // frame interface is only fatal for the texture path. Under Vulkan there is no
+    // gl_renderer at all, and bailing here is what made the webview disappear.
     frame_interface = frame_interface_new(flutterpi_get_gl_renderer(flutterpi));
-    if (frame_interface == NULL)
+    if (frame_interface == NULL && getenv("FLUTTERPI_WEBVIEW_ON_PLANE") == NULL)
         goto fail_destroy_texture;
 
     texture_id = texture_get_id(texture);
@@ -1460,6 +1519,27 @@ static struct gstplayer *gstplayer_new(struct flutterpi *flutterpi, const char *
     player->next_web_call_id = 1;
     player->busfd_events = NULL;
     player->is_live = false;
+    // Opt-in: present frames on a DRM overlay plane instead of uploading them as a
+    // texture. Renderer-agnostic, so this is what survives under Vulkan.
+    player->dmabuf_surface = NULL;
+    player->platform_view_id = 0;
+    if (getenv("FLUTTERPI_WEBVIEW_ON_PLANE") != NULL) {
+        player->dmabuf_surface = dmabuf_surface_new(
+            flutterpi_get_tracer(player->flutterpi),
+            flutterpi_get_texture_registry(player->flutterpi)
+        );
+        if (player->dmabuf_surface != NULL) {
+            // The compositor casts this id straight back to a surface pointer in
+        // release builds (compositor_ng.c), so it MUST be the surface pointer.
+        player->platform_view_id = (int64_t) (intptr_t) CAST_SURFACE_UNCHECKED(player->dmabuf_surface);
+            compositor_set_platform_view(
+                flutterpi_get_compositor(player->flutterpi),
+                player->platform_view_id,
+                CAST_SURFACE_UNCHECKED(player->dmabuf_surface)
+            );
+        }
+    }
+
     return player;
 
 fail_unref_pending_web_replies:
@@ -1486,7 +1566,9 @@ fail_free_gst_headers:
     free(uri_owned);
 
 fail_destroy_frame_interface:
-    frame_interface_unref(frame_interface);
+    if (frame_interface != NULL) {
+        frame_interface_unref(frame_interface);
+    }
 
 fail_destroy_texture:
     texture_destroy(texture);
@@ -1553,13 +1635,20 @@ void gstplayer_destroy(struct gstplayer *player) {
     if (player->pipeline_description != NULL) {
         free(player->pipeline_description);
     }
-    frame_interface_unref(player->frame_interface);
+    if (player->frame_interface != NULL) {
+        frame_interface_unref(player->frame_interface);
+    }
     texture_destroy(player->texture);
     free(player);
 }
 
 int64_t gstplayer_get_texture_id(struct gstplayer *player) {
     return player->texture_id;
+}
+
+int64_t gstplayer_get_platform_view_id(struct gstplayer *player) {
+    ASSERT_NOT_NULL(player);
+    return player->platform_view_id;
 }
 
 void gstplayer_put_http_header(struct gstplayer *player, const char *key, const char *value) {

@@ -1017,6 +1017,16 @@ struct gbm_device *flutterpi_get_gbm_device(struct flutterpi *flutterpi) {
     return drmdev_get_gbm_device(flutterpi->drmdev);
 }
 
+struct compositor *flutterpi_get_compositor(struct flutterpi *flutterpi) {
+    ASSERT_NOT_NULL(flutterpi);
+    return flutterpi->compositor;
+}
+
+struct tracer *flutterpi_get_tracer(struct flutterpi *flutterpi) {
+    ASSERT_NOT_NULL(flutterpi);
+    return flutterpi->tracer;
+}
+
 bool flutterpi_has_gl_renderer(struct flutterpi *flutterpi) {
     ASSERT_NOT_NULL(flutterpi);
     return flutterpi->gl_renderer != NULL;
