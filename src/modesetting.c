@@ -1609,6 +1609,16 @@ uint32_t drmdev_add_fb_multiplanar_locked(
     memcpy(fb->pitches, pitches, sizeof(fb->pitches));
     memcpy(fb->offsets, offsets, sizeof(fb->offsets));
 
+    if (has_modifiers) {
+        // Some drivers (e.g. virtio-gpu) don't support ADDFB2 with modifiers.
+        // Fall back to the non-modifier path there, instead of failing to add
+        // the framebuffer.
+        uint64_t addfb2_mods_cap = 0;
+        if (drmGetCap(drmdev->fd, DRM_CAP_ADDFB2_MODIFIERS, &addfb2_mods_cap) != 0 || addfb2_mods_cap == 0) {
+            has_modifiers = false;
+        }
+    }
+
     fb_id = 0;
     if (has_modifiers) {
         ok = drmModeAddFB2WithModifiers(
