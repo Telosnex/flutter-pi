@@ -241,7 +241,9 @@ MUST_CHECK struct vk_renderer *vk_renderer_new() {
     }
 #endif
 
-    /// TODO: Maybe enable some other useful instance extensions here?
+    // Presentation is surfaceless: Flutter renders into compositor-provided
+    // VkImages and flutter-pi presents them through GBM/KMS. No WSI instance
+    // extension is needed by the patched engine.
 
     ok = vkCreateInstance(
         &(VkInstanceCreateInfo){
