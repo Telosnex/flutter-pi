@@ -54,6 +54,33 @@ void frame_scheduler_destroy(struct frame_scheduler *scheduler);
 DECLARE_REF_OPS(frame_scheduler)
 
 /**
+ * @brief Whether this scheduler was created with uses_frame_requests = true,
+ * i.e. whether @ref frame_scheduler_on_fl_vsync_request will be called and the
+ * engine vsync callback should be installed.
+ */
+bool frame_scheduler_uses_frame_requests(struct frame_scheduler *scheduler);
+
+/**
+ * @brief Sets the display refresh interval used for the timestamps that are
+ * sent to flutter in vsync replies.
+ *
+ * Should be called by the window once the display mode is known.
+ */
+void frame_scheduler_set_frame_interval(struct frame_scheduler *scheduler, uint64_t interval_ns);
+
+/**
+ * @brief Must be called when the present callback given to
+ * @ref frame_scheduler_present_frame could not actually submit the frame for
+ * presentation (e.g. the atomic commit failed).
+ *
+ * No scanout event will arrive for the frame in that case, so the scheduler
+ * resets the presentation pipeline: a queued frame is cancelled and a pending
+ * flutter vsync request is replied to immediately, so the engine doesn't
+ * stall forever.
+ */
+void frame_scheduler_on_present_failed(struct frame_scheduler *scheduler);
+
+/**
  * @brief Called when flutter calls the embedder supplied vsync_callback.
  * Embedder should reply on the platform task thread with the timestamp
  * of the next vsync request. Engine will wait till that time and then begin
@@ -79,5 +106,20 @@ void frame_scheduler_on_fb_released(struct frame_scheduler *scheduler, bool has_
  * @param cancel_cb  Called when the frame is not going to be presented, and all associated resources should be freed.
  */
 void frame_scheduler_present_frame(struct frame_scheduler *scheduler, void_callback_t present_cb, void *userdata, void_callback_t cancel_cb);
+
+/**
+ * @brief Must be called when a frame that was presented using
+ * @ref frame_scheduler_present_frame has been scanned out (its page flip has
+ * completed).
+ *
+ * This will potentially present the next queued frame, and reply to a pending
+ * flutter vsync request with the actual scanout timestamp.
+ *
+ * @param scheduler     The frame scheduler instance.
+ * @param has_timestamp True if timestamp_ns contains the (CLOCK_MONOTONIC)
+ *                      vblank timestamp of the page flip.
+ * @param timestamp_ns  The vblank timestamp of the page flip.
+ */
+void frame_scheduler_on_scanout(struct frame_scheduler *scheduler, bool has_timestamp, uint64_t timestamp_ns);
 
 #endif  // _FLUTTERPI_SRC_FRAME_SCHEDULER_H

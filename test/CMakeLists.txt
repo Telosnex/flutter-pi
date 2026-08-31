@@ -21,3 +21,15 @@ target_link_libraries(
 )
 
 add_test(flutterpi_test flutterpi_test)
+
+add_executable(frame_scheduler_test
+    frame_scheduler_test.c
+)
+
+target_link_libraries(
+    frame_scheduler_test
+    flutterpi_module
+    Unity
+)
+
+add_test(frame_scheduler_test frame_scheduler_test)
