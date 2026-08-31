@@ -129,4 +129,11 @@ ATTR_PURE const char **vk_renderer_get_enabled_device_extensions(struct vk_rende
  */
 ATTR_PURE int vk_renderer_find_mem_type(struct vk_renderer *renderer, VkMemoryPropertyFlags flags, uint32_t req_bits);
 
+/**
+ * @brief Whether binary semaphores can be exported as sync-file fds
+ * (VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT), for use as explicit
+ * render-completion fences (e.g. a KMS IN_FENCE_FD).
+ */
+bool vk_renderer_supports_sync_fd_semaphore_export(struct vk_renderer *renderer);
+
 #endif  // _FLUTTERPI_SRC_VK_RENDERER_H

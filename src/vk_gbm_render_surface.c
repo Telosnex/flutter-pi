@@ -97,6 +97,20 @@ struct vk_gbm_render_surface {
      */
     enum pixfmt pixel_format;
 
+    /**
+     * @brief Exportable binary semaphore used to hand a render-completion
+     * fence (sync-file fd) to KMS as the plane IN_FENCE_FD.
+     *
+     * VK_NULL_HANDLE if the driver can't export SYNC_FD semaphores; in that
+     * case we fall back to vkDeviceWaitIdle before presenting.
+     *
+     * Exporting a SYNC_FD payload has wait semantics (it resets the
+     * semaphore), so a single semaphore can be reused every frame.
+     */
+    VkSemaphore render_finished_semaphore;
+    PFN_vkGetSemaphoreFdKHR get_semaphore_fd;
+    bool logged_explicit_sync_fallback;
+
 #ifdef DEBUG
     /**
      * @brief The number of framebuffers that are currently locked.
@@ -491,6 +505,47 @@ fail_deinit_previous_fbs:
 #ifdef DEBUG
     surface->n_locked_fbs = 0;
 #endif
+
+    surface->render_finished_semaphore = VK_NULL_HANDLE;
+    surface->get_semaphore_fd = NULL;
+    surface->logged_explicit_sync_fallback = false;
+    if (vk_renderer_supports_sync_fd_semaphore_export(renderer)) {
+        VkDevice device = vk_renderer_get_device(renderer);
+
+        PFN_vkGetSemaphoreFdKHR get_semaphore_fd = (PFN_vkGetSemaphoreFdKHR) vkGetDeviceProcAddr(device, "vkGetSemaphoreFdKHR");
+        if (get_semaphore_fd != NULL) {
+            VkSemaphore semaphore = VK_NULL_HANDLE;
+            VkResult vk_ok = vkCreateSemaphore(
+                device,
+                &(VkSemaphoreCreateInfo){
+                    .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+                    .flags = 0,
+                    .pNext =
+                        &(VkExportSemaphoreCreateInfo){
+                            .sType = VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO,
+                            .handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
+                            .pNext = NULL,
+                        },
+                },
+                NULL,
+                &semaphore
+            );
+            if (vk_ok == VK_SUCCESS) {
+                surface->render_finished_semaphore = semaphore;
+                surface->get_semaphore_fd = get_semaphore_fd;
+            } else {
+                LOG_VK_ERROR(vk_ok, "Couldn't create exportable render-completion semaphore. vkCreateSemaphore");
+            }
+        }
+    }
+
+    if (surface->render_finished_semaphore == VK_NULL_HANDLE) {
+        LOG_DEBUG(
+            "Vulkan driver doesn't support exporting render-completion fences as sync-file fds. "
+            "Falling back to waiting for device idle before presenting, which is slow.\n"
+        );
+    }
+
     return 0;
 
 fail_deinit_render_surface:
@@ -531,6 +586,13 @@ void vk_gbm_render_surface_deinit(struct surface *s) {
     struct vk_gbm_render_surface *vk_surface;
 
     vk_surface = CAST_THIS(s);
+
+    if (vk_surface->render_finished_semaphore != VK_NULL_HANDLE) {
+        // Make sure a pending signal operation on the semaphore has completed
+        // before destroying it.
+        vkDeviceWaitIdle(vk_renderer_get_device(vk_surface->renderer));
+        vkDestroySemaphore(vk_renderer_get_device(vk_surface->renderer), vk_surface->render_finished_semaphore, NULL);
+    }
 
     for (int i = 0; i < ARRAY_SIZE(vk_surface->fbs); i++) {
         fb_deinit(vk_surface->fbs + i, vk_renderer_get_device(vk_surface->renderer));
@@ -666,7 +728,68 @@ static int vk_gbm_render_surface_present_kms(struct surface *s, const struct fl_
     fb_id = meta->fb_id;
     pixel_format = vk_surface->pixel_format;
 
-    vkDeviceWaitIdle(vk_renderer_get_device(vk_surface->renderer));
+    // KMS must not scan the framebuffer out before the GPU has finished
+    // rendering into it. Unlike EGL/GL, Vulkan does not reliably participate
+    // in implicit dma-resv synchronization, so hand KMS an explicit
+    // render-completion fence:
+    //
+    // The engine has already submitted all rendering commands for this frame
+    // to our graphics queue (this runs inside the present_layers engine
+    // callback, on the raster thread, after the engine flushed & submitted
+    // its work). Submit an empty batch that signals our exportable binary
+    // semaphore -- queue submission order guarantees it signals only after
+    // all previously submitted work has completed -- then export the payload
+    // as a sync-file fd and attach it to the KMS plane as IN_FENCE_FD.
+    //
+    // If that's unsupported (or fails), fall back to a full device wait.
+    int in_fence_fd = -1;
+    if (vk_surface->render_finished_semaphore != VK_NULL_HANDLE) {
+        VkResult vk_ok;
+
+        TRACER_BEGIN(vk_surface->surface.tracer, "export render-completion fence");
+        vk_ok = vkQueueSubmit(
+            vk_renderer_get_queue(vk_surface->renderer),
+            1,
+            &(VkSubmitInfo){
+                .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                .waitSemaphoreCount = 0,
+                .commandBufferCount = 0,
+                .signalSemaphoreCount = 1,
+                .pSignalSemaphores = (VkSemaphore[1]){ vk_surface->render_finished_semaphore },
+                .pNext = NULL,
+            },
+            VK_NULL_HANDLE
+        );
+        if (vk_ok == VK_SUCCESS) {
+            vk_ok = vk_surface->get_semaphore_fd(
+                vk_renderer_get_device(vk_surface->renderer),
+                &(VkSemaphoreGetFdInfoKHR){
+                    .sType = VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR,
+                    .semaphore = vk_surface->render_finished_semaphore,
+                    .handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
+                    .pNext = NULL,
+                },
+                &in_fence_fd
+            );
+            if (vk_ok != VK_SUCCESS) {
+                in_fence_fd = -1;
+                if (!vk_surface->logged_explicit_sync_fallback) {
+                    vk_surface->logged_explicit_sync_fallback = true;
+                    LOG_VK_ERROR(vk_ok, "Couldn't export render-completion fence, waiting for device idle instead. vkGetSemaphoreFdKHR");
+                }
+            }
+        } else if (!vk_surface->logged_explicit_sync_fallback) {
+            vk_surface->logged_explicit_sync_fallback = true;
+            LOG_VK_ERROR(vk_ok, "Couldn't submit render-completion fence signal, waiting for device idle instead. vkQueueSubmit");
+        }
+        TRACER_END(vk_surface->surface.tracer, "export render-completion fence");
+    }
+
+    if (in_fence_fd < 0) {
+        TRACER_BEGIN(vk_surface->surface.tracer, "vkDeviceWaitIdle");
+        vkDeviceWaitIdle(vk_renderer_get_device(vk_surface->renderer));
+        TRACER_END(vk_surface->surface.tracer, "vkDeviceWaitIdle");
+    }
 
     TRACER_BEGIN(vk_surface->surface.tracer, "kms_req_builder_push_fb_layer");
     ok = kms_req_builder_push_fb_layer(
@@ -692,8 +815,9 @@ static int vk_gbm_render_surface_present_kms(struct surface *s, const struct fl_
             .rotation = PLANE_TRANSFORM_ROTATE_0,
             .enforce_rotation = false,
 
-            .has_in_fence_fd = false,
-            .in_fence_fd = 0,
+            // On success, the KMS request takes ownership of the fd.
+            .has_in_fence_fd = in_fence_fd >= 0,
+            .in_fence_fd = in_fence_fd,
         },
         on_release_layer,
         NULL,
@@ -702,6 +826,9 @@ static int vk_gbm_render_surface_present_kms(struct surface *s, const struct fl_
     );
     TRACER_END(vk_surface->surface.tracer, "kms_req_builder_push_fb_layer");
     if (ok != 0) {
+        if (in_fence_fd >= 0) {
+            close(in_fence_fd);
+        }
         goto fail_unref_locked_fb;
     }
 

@@ -8,6 +8,7 @@
 #include "vk_renderer.h"
 
 #include <stdlib.h>
+#include <string.h>
 
 #include <alloca.h>
 #include <vulkan.h>
@@ -584,6 +585,28 @@ ATTR_PURE int vk_renderer_get_enabled_device_extension_count(struct vk_renderer 
 ATTR_PURE const char **vk_renderer_get_enabled_device_extensions(struct vk_renderer *renderer) {
     ASSERT_NOT_NULL(renderer);
     return renderer->enabled_device_extensions;
+}
+
+bool vk_renderer_supports_sync_fd_semaphore_export(struct vk_renderer *renderer) {
+    VkExternalSemaphoreProperties props;
+
+    ASSERT_NOT_NULL(renderer);
+
+    memset(&props, 0, sizeof props);
+    props.sType = VK_STRUCTURE_TYPE_EXTERNAL_SEMAPHORE_PROPERTIES;
+
+    // Core in Vulkan 1.1, which we require.
+    vkGetPhysicalDeviceExternalSemaphoreProperties(
+        renderer->physical_device,
+        &(VkPhysicalDeviceExternalSemaphoreInfo){
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_SEMAPHORE_INFO,
+            .handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
+            .pNext = NULL,
+        },
+        &props
+    );
+
+    return (props.externalSemaphoreFeatures & VK_EXTERNAL_SEMAPHORE_FEATURE_EXPORTABLE_BIT) != 0;
 }
 
 ATTR_PURE int vk_renderer_find_mem_type(struct vk_renderer *renderer, VkMemoryPropertyFlags flags, uint32_t req_bits) {
