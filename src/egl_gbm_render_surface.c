@@ -13,6 +13,8 @@
 #include <errno.h>
 #include <stdlib.h>
 
+#include <pthread.h>
+
 #include "egl.h"
 #include "gl_renderer.h"
 #include "gles.h"
@@ -62,6 +64,24 @@ struct egl_gbm_render_surface {
     atomic_int n_locked_fbs;
     bool logged_format_and_modifier;
 #endif
+
+    /**
+     * @brief GBM BOs that are no longer displayed and should be released back
+     * to the GBM surface.
+     *
+     * mesa's gbm_surface is not thread-safe: gbm_surface_release_buffer must
+     * not race with the internal back-buffer acquisition that happens on the
+     * render thread (inside EGL / GL calls). Now that buffers are released
+     * from the page-flip handler (which runs on the event loop thread), the
+     * release is deferred: locked_fb_destroy only queues the BO here, and the
+     * queue is drained on the render thread before the next buffer
+     * acquisition.
+     *
+     * Guarded by pending_release_mutex.
+     */
+    pthread_mutex_t pending_release_mutex;
+    struct gbm_bo *pending_releases[8];
+    size_t n_pending_releases;
 };
 
 COMPILE_ASSERT(offsetof(struct egl_gbm_render_surface, surface) == 0);
@@ -79,12 +99,36 @@ static void locked_fb_destroy(struct locked_fb *fb) {
 
     s = fb->surface;
     fb->surface = NULL;
-    gbm_surface_release_buffer(s->gbm_surface, fb->bo);
+
+    // Defer the actual gbm_surface_release_buffer to the render thread.
+    // This can run on the event loop thread (from the page-flip handler),
+    // and mesa's gbm_surface buffer bookkeeping is not thread-safe against
+    // the back-buffer acquisition happening in GL on the render thread.
+    pthread_mutex_lock(&s->pending_release_mutex);
+    ASSERT(s->n_pending_releases < ARRAY_SIZE(s->pending_releases));
+    s->pending_releases[s->n_pending_releases++] = fb->bo;
+    pthread_mutex_unlock(&s->pending_release_mutex);
+
 #ifdef DEBUG
     atomic_fetch_sub(&s->n_locked_fbs, 1);
 #endif
     atomic_flag_clear(&fb->is_locked);
     surface_unref(CAST_SURFACE(s));
+}
+
+/**
+ * @brief Release all BOs queued by @ref locked_fb_destroy back to the GBM
+ * surface. Must be called on the render thread (or a thread that's guaranteed
+ * not to race with rendering / eglSwapBuffers), before buffers are needed
+ * again.
+ */
+static void egl_gbm_render_surface_drain_pending_releases(struct egl_gbm_render_surface *s) {
+    pthread_mutex_lock(&s->pending_release_mutex);
+    for (size_t i = 0; i < s->n_pending_releases; i++) {
+        gbm_surface_release_buffer(s->gbm_surface, s->pending_releases[i]);
+    }
+    s->n_pending_releases = 0;
+    pthread_mutex_unlock(&s->pending_release_mutex);
 }
 
 DEFINE_STATIC_REF_OPS(locked_fb, n_refs)
@@ -244,6 +288,8 @@ static int egl_gbm_render_surface_init(
         s->locked_fbs[i].is_locked = (atomic_flag) ATOMIC_FLAG_INIT;
     }
     s->locked_front_fb = NULL;
+    pthread_mutex_init(&s->pending_release_mutex, get_default_mutex_attrs());
+    s->n_pending_releases = 0;
 #ifdef DEBUG
     s->n_locked_fbs = 0;
     s->logged_format_and_modifier = false;
@@ -339,6 +385,8 @@ void egl_gbm_render_surface_deinit(struct surface *s) {
 
     egl_surface = CAST_EGL_GBM_RENDER_SURFACE(s);
 
+    egl_gbm_render_surface_drain_pending_releases(egl_surface);
+    pthread_mutex_destroy(&egl_surface->pending_release_mutex);
     gl_renderer_unref(egl_surface->renderer);
     render_surface_deinit(s);
 }
@@ -590,6 +638,11 @@ egl_gbm_render_surface_present_fbdev(struct surface *s, const struct fl_layer_pr
 }
 
 static int egl_gbm_render_surface_fill(struct render_surface *s, FlutterBackingStore *fl_store) {
+    // Flutter is about to render a new frame into this surface; the GL stack
+    // will acquire a back buffer on the render thread. Give back any buffers
+    // that were retired by page flips first.
+    egl_gbm_render_surface_drain_pending_releases(CAST_THIS(s));
+
     fl_store->type = kFlutterBackingStoreTypeOpenGL;
     fl_store->open_gl = (FlutterOpenGLBackingStore
     ){ .type = kFlutterOpenGLTargetTypeFramebuffer,
@@ -626,6 +679,10 @@ static int egl_gbm_render_surface_queue_present(struct render_surface *s, const 
     if (egl_surface->locked_front_fb != NULL) {
         locked_fb_unrefp(&egl_surface->locked_front_fb);
     }
+
+    // Give buffers retired by page flips back to the GBM surface. (We're on
+    // the render thread here.)
+    egl_gbm_render_surface_drain_pending_releases(egl_surface);
 
     assert(gbm_surface_has_free_buffers(egl_surface->gbm_surface));
 
