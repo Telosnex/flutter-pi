@@ -259,6 +259,9 @@ struct flutterpi {
      */
     struct plugin_registry *plugin_registry;
 
+    /** Dynamic plugin loaded from the application bundle, if present. */
+    void *webrtc_plugin_handle;
+
     /**
      * @brief Manages all external textures registered to the flutter engine.
      *
@@ -1186,6 +1189,39 @@ static void *load_flutter_engine_lib(struct flutter_paths *paths) {
 
 static void unload_flutter_engine_lib(void *handle) {
     dlclose(handle);
+}
+
+static int load_optional_bundle_plugin(const char *bundle_path, const char *filename, void **handle_out) {
+    char *path;
+    int ok;
+
+    *handle_out = NULL;
+    ok = asprintf(&path, "%s/%s", bundle_path, filename);
+    if (ok < 0) {
+        return ENOMEM;
+    }
+
+    if (access(path, R_OK) != 0) {
+        ok = errno;
+        if (ok == ENOENT) {
+            free(path);
+            return 0;
+        }
+        LOG_ERROR("Could not access dynamic plugin %s: %s\n", path, strerror(ok));
+        free(path);
+        return ok;
+    }
+
+    *handle_out = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+    if (*handle_out == NULL) {
+        LOG_ERROR("Could not load dynamic plugin %s: %s\n", path, dlerror());
+        free(path);
+        return EINVAL;
+    }
+
+    fprintf(stderr, "flutter-pi: Loaded dynamic plugin: %s\n", path);
+    free(path);
+    return 0;
 }
 
 static int get_flutter_engine_procs(void *engine_handle, FlutterEngineProcTable *procs_out) {
@@ -2357,7 +2393,7 @@ struct flutterpi *flutterpi_new_from_args(int argc, char **argv) {
     struct drmdev *drmdev;
     struct tracer *tracer;
     struct window *window;
-    void *engine_handle;
+    void *engine_handle, *webrtc_plugin_handle;
     char *bundle_path, **engine_argv, *desired_videomode;
     int ok, engine_argc, wakeup_fd;
 
@@ -2684,6 +2720,7 @@ struct flutterpi *flutterpi_new_from_args(int argc, char **argv) {
         sd_event_source_unref(user_input_event_source);
     }
 
+    webrtc_plugin_handle = NULL;
     engine_handle = load_flutter_engine_lib(paths);
     if (engine_handle == NULL) {
         goto fail_destroy_user_input;
@@ -2701,10 +2738,15 @@ struct flutterpi *flutterpi_new_from_args(int argc, char **argv) {
         fpi->flutter.procs.TraceEventInstant
     );
 
+    ok = load_optional_bundle_plugin(bundle_path, "libflutter_webrtc_flutterpi.so", &webrtc_plugin_handle);
+    if (ok != 0) {
+        goto fail_unload_engine;
+    }
+
     plugin_registry = plugin_registry_new(fpi);
     if (plugin_registry == NULL) {
         LOG_ERROR("Could not create plugin registry.\n");
-        goto fail_unload_engine;
+        goto fail_unload_bundle_plugin;
     }
 
     ok = plugin_registry_add_plugins_from_static_registry(plugin_registry);
@@ -2780,6 +2822,7 @@ struct flutterpi *flutterpi_new_from_args(int argc, char **argv) {
     fpi->flutter.aot_data = aot_data;
     fpi->drmdev = drmdev;
     fpi->plugin_registry = plugin_registry;
+    fpi->webrtc_plugin_handle = webrtc_plugin_handle;
     fpi->texture_registry = texture_registry;
     fpi->libseat = libseat;
     return fpi;
@@ -2789,6 +2832,11 @@ fail_destroy_texture_registry:
 
 fail_destroy_plugin_registry:
     plugin_registry_destroy(plugin_registry);
+
+fail_unload_bundle_plugin:
+    if (webrtc_plugin_handle != NULL) {
+        dlclose(webrtc_plugin_handle);
+    }
 
 fail_unload_engine:
     unload_flutter_engine_lib(engine_handle);
@@ -2871,6 +2919,9 @@ void flutterpi_destroy(struct flutterpi *flutterpi) {
     pthread_mutex_destroy(&flutterpi->platform_task_queue_mutex);
     texture_registry_destroy(flutterpi->texture_registry);
     plugin_registry_destroy(flutterpi->plugin_registry);
+    if (flutterpi->webrtc_plugin_handle != NULL) {
+        dlclose(flutterpi->webrtc_plugin_handle);
+    }
     unload_flutter_engine_lib(flutterpi->flutter.engine_handle);
     user_input_destroy(flutterpi->user_input);
     compositor_unref(flutterpi->compositor);
