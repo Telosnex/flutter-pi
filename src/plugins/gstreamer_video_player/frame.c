@@ -1,4 +1,5 @@
 #include <inttypes.h>
+#include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -359,16 +360,29 @@ UNUSED int dup_gst_buffer_range_as_dmabuf(struct gbm_device *gbm_device, GstBuff
         return -1;
     }
 
-    bo = gbm_bo_create(gbm_device, map_info.size, 1, GBM_FORMAT_R8, GBM_BO_USE_LINEAR);
+    // Upload the frame bytes into a square BO rather than one huge single row:
+    // drivers cap BO dimensions (v3d caps width AND height at 4096; intel iris
+    // hit the same wall). Restores upstream 9a8689a, lost in the #482 revert.
+    uint32_t dim = (uint32_t) ceil(sqrt((double) map_info.size));
+
+    bo = gbm_bo_create(gbm_device, dim, dim, GBM_FORMAT_R8, GBM_BO_USE_LINEAR);
     if (bo == NULL) {
         LOG_ERROR("Couldn't create GBM BO to copy video frame into.\n");
         goto fail_unmap_buffer;
     }
 
     map_data = NULL;
-    map = gbm_bo_map(bo, 0, 0, map_info.size, 1, GBM_BO_TRANSFER_WRITE, &stride, &map_data);
+    map = gbm_bo_map(bo, 0, 0, dim, dim, GBM_BO_TRANSFER_WRITE, &stride, &map_data);
     if (map == NULL) {
         LOG_ERROR("Couldn't mmap GBM BO to copy video frame into it.\n");
+        goto fail_destroy_bo;
+    }
+
+    // The exported fd is imported downstream as a flat byte array, so any row
+    // padding would shift every row and corrupt the frame. Fail loudly instead.
+    if (stride != dim) {
+        LOG_ERROR("GBM BO stride %u does not match width %u; cannot copy frame contiguously.\n", (unsigned) stride, (unsigned) dim);
+        gbm_bo_unmap(bo, map_data);
         goto fail_destroy_bo;
     }
 
@@ -415,16 +429,29 @@ UNUSED int dup_gst_memory_as_dmabuf(struct gbm_device *gbm_device, GstMemory *me
         return -1;
     }
 
-    bo = gbm_bo_create(gbm_device, map_info.size, 1, GBM_FORMAT_R8, GBM_BO_USE_LINEAR);
+    // Upload the frame bytes into a square BO rather than one huge single row:
+    // drivers cap BO dimensions (v3d caps width AND height at 4096; intel iris
+    // hit the same wall). Restores upstream 9a8689a, lost in the #482 revert.
+    uint32_t dim = (uint32_t) ceil(sqrt((double) map_info.size));
+
+    bo = gbm_bo_create(gbm_device, dim, dim, GBM_FORMAT_R8, GBM_BO_USE_LINEAR);
     if (bo == NULL) {
         LOG_ERROR("Couldn't create GBM BO to copy video frame into.\n");
         goto fail_unmap_buffer;
     }
 
     map_data = NULL;
-    map = gbm_bo_map(bo, 0, 0, map_info.size, 1, GBM_BO_TRANSFER_WRITE, &stride, &map_data);
+    map = gbm_bo_map(bo, 0, 0, dim, dim, GBM_BO_TRANSFER_WRITE, &stride, &map_data);
     if (map == NULL) {
         LOG_ERROR("Couldn't mmap GBM BO to copy video frame into it.\n");
+        goto fail_destroy_bo;
+    }
+
+    // The exported fd is imported downstream as a flat byte array, so any row
+    // padding would shift every row and corrupt the frame. Fail loudly instead.
+    if (stride != dim) {
+        LOG_ERROR("GBM BO stride %u does not match width %u; cannot copy frame contiguously.\n", (unsigned) stride, (unsigned) dim);
+        gbm_bo_unmap(bo, map_data);
         goto fail_destroy_bo;
     }
 
