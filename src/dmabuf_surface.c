@@ -87,6 +87,11 @@ struct dmabuf_surface {
 
     struct texture *texture;
     struct refcounted_dmabuf *next_buf;
+
+    /// True once the compositor has successfully pushed this surface as a KMS
+    /// layer. Until that happens the producer must keep feeding its texture,
+    /// otherwise a platform view that never composites shows nothing at all.
+    bool presented_once;
 };
 
 COMPILE_ASSERT(offsetof(struct dmabuf_surface, surface) == 0);
@@ -140,6 +145,7 @@ int dmabuf_surface_init(struct dmabuf_surface *s, struct tracer *tracer, struct 
 
     s->texture = texture;
     s->next_buf = NULL;
+    s->presented_once = false;
     return 0;
 }
 
@@ -258,6 +264,7 @@ static int dmabuf_surface_present_kms(struct surface *_s, const struct fl_layer_
 
     surface_lock(_s);
 
+
     // Flutter presents the platform view as soon as the layer exists, which is
     // before the first frame has been pushed. That is legitimate: there is simply
     // nothing to scan out yet, so skip this frame rather than asserting (the
@@ -328,6 +335,19 @@ static int dmabuf_surface_present_kms(struct surface *_s, const struct fl_layer_
         return ok;
     }
 
+    if (!s->presented_once) {
+        s->presented_once = true;
+        LOG_ERROR(
+            "Plane path live: presenting %" PRIu32 "x%" PRIu32 " at (%d,%d) size %dx%d.\n",
+            s->next_buf->buf.width,
+            s->next_buf->buf.height,
+            (int) props->aa_rect.offset.x,
+            (int) props->aa_rect.offset.y,
+            (int) props->aa_rect.size.x,
+            (int) props->aa_rect.size.y
+        );
+    }
+
     surface_unlock(_s);
 
     return 0;
@@ -343,4 +363,16 @@ static int dmabuf_surface_present_fbdev(struct surface *_s, const struct fl_laye
     UNIMPLEMENTED();
 
     return 0;
+}
+
+bool dmabuf_surface_was_presented(struct dmabuf_surface *s) {
+    bool presented;
+
+    ASSERT_NOT_NULL(s);
+
+    surface_lock(CAST_SURFACE_UNCHECKED(s));
+    presented = s->presented_once;
+    surface_unlock(CAST_SURFACE_UNCHECKED(s));
+
+    return presented;
 }

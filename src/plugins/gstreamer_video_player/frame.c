@@ -156,14 +156,17 @@ int frame_dup_sample_as_scanout_dmabuf(struct gbm_device *gbm_device, GstSample 
     meta = gst_buffer_get_video_meta(buffer);
     src_stride = meta != NULL ? (uint32_t) meta->stride[0] : (uint32_t) GST_VIDEO_INFO_PLANE_STRIDE(&info, 0);
 
-    // WPE hands us packed BGRA/BGRx; both scan out as ARGB8888 on little endian.
+    // WPE hands us packed BGRx: the fourth byte is PADDING, not alpha. Scanning
+    // that out as ARGB8888 yields alpha=0 and an invisible plane. XRGB8888 makes
+    // the display controller ignore it, which is what we want - web content is
+    // opaque, there is nothing to blend against.
     return dup_gst_frame_as_scanout_dmabuf(
         gbm_device,
         buffer,
         (uint32_t) GST_VIDEO_INFO_WIDTH(&info),
         (uint32_t) GST_VIDEO_INFO_HEIGHT(&info),
-        PIXFMT_ARGB8888,
-        GBM_FORMAT_ARGB8888,
+        PIXFMT_XRGB8888,
+        GBM_FORMAT_XRGB8888,
         src_stride,
         dmabuf_out
     );

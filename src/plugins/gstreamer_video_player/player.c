@@ -183,6 +183,10 @@ struct gstplayer {
     struct dmabuf_surface *dmabuf_surface;
     int64_t platform_view_id;
 
+    /// Frames pushed to the plane before the compositor ever presented it.
+    /// Keeps the texture path alive as a fallback, and says so out loud.
+    int plane_frames_without_present;
+
     struct frame_interface *frame_interface;
 
     GstElement *pipeline, *sink, *websrc;
@@ -1165,10 +1169,25 @@ static GstFlowReturn on_appsink_new_sample(GstAppSink *appsink, void *userdata) 
             }
         }
 
-        gst_sample_unref(sample);
-        return GST_FLOW_OK;
-    }
+        // Fail-safe: keep feeding the texture until the compositor proves it has
+        // actually presented this surface. A platform view that never composites
+        // then degrades to the texture path instead of showing a blank widget,
+        // which is exactly how this shipped broken.
+        if (dmabuf_surface_was_presented(player->dmabuf_surface) || player->frame_interface == NULL) {
+            gst_sample_unref(sample);
+            return GST_FLOW_OK;
+        }
 
+        player->plane_frames_without_present++;
+        if (player->plane_frames_without_present == 120) {
+            LOG_ERROR(
+                "Platform view still not presented after 120 frames; staying on the "
+                "texture path. The plane is registered but nothing is compositing it.\n"
+            );
+        }
+
+        // fall through and upload the texture as well
+    }
 
     frame = frame_new(player->frame_interface, sample, player->has_gst_info ? &player->gst_info : NULL);
 
@@ -1523,6 +1542,7 @@ static struct gstplayer *gstplayer_new(struct flutterpi *flutterpi, const char *
     // texture. Renderer-agnostic, so this is what survives under Vulkan.
     player->dmabuf_surface = NULL;
     player->platform_view_id = 0;
+        player->plane_frames_without_present = 0;
     if (getenv("FLUTTERPI_WEBVIEW_ON_PLANE") != NULL) {
         player->dmabuf_surface = dmabuf_surface_new(
             flutterpi_get_tracer(player->flutterpi),

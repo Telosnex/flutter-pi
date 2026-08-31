@@ -42,6 +42,10 @@ MUST_CHECK struct dmabuf_surface *dmabuf_surface_new(struct tracer *tracer, stru
 
 int dmabuf_surface_push_dmabuf(struct dmabuf_surface *s, const struct dmabuf *buf, dmabuf_release_cb_t release_cb);
 
+/// True once the compositor has actually pushed this surface as a KMS layer.
+/// Producers must keep their texture fed until this returns true.
+bool dmabuf_surface_was_presented(struct dmabuf_surface *s);
+
 ATTR_PURE int64_t dmabuf_surface_get_texture_id(struct dmabuf_surface *s);
 
 #endif  // _FLUTTERPI_SRC_DMABUF_SURFACE_H
