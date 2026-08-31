@@ -1746,7 +1746,10 @@ uint32_t drmdev_add_fb_from_dmabuf_locked(
         return 0;
     }
 
-    return drmdev_add_fb_locked(drmdev, width, height, pixel_format, prime_fd, pitch, offset, has_modifier, modifier);
+    // Pass the imported GEM handle, not the prime fd: drmModeAddFB2 looks the
+    // handle up in the device GEM namespace, so handing it an fd number makes it
+    // fail with ENOENT.
+    return drmdev_add_fb_locked(drmdev, width, height, pixel_format, bo_handle, pitch, offset, has_modifier, modifier);
 }
 
 uint32_t drmdev_add_fb_from_dmabuf(
