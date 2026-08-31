@@ -16,6 +16,7 @@ int __printJSON(struct json_value *value, int indent) {
         case kJsonTrue: printf("true"); break;
         case kJsonFalse: printf("false"); break;
         case kJsonNumber: printf("%f", value->number_value); break;
+        case kJsonInteger: printf("%" PRIi64, value->integer_value); break;
         case kJsonString: printf("\"%s\"", value->string_value); break;
         case kJsonArray:
             printf("[\n");

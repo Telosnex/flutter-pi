@@ -4,6 +4,7 @@
 #include <limits.h>
 #include <math.h>
 #include <stdalign.h>
+#include <stdlib.h>
 
 #include <unity.h>
 
@@ -15,6 +16,28 @@ void setUp() {
 }
 
 void tearDown() {
+}
+
+void test_json_integer_encoding_preserves_exact_decimal_syntax() {
+    struct platch_obj object = PLATCH_OBJ_JSON_MSG(
+        JSONOBJECT4(
+            "unicodeScalarValues", JSONINT(0),
+            "keyCode", JSONINT(0x1008ff12),  // XF86AudioMute
+            "scanCode", JSONINT(121),
+            "modifiers", JSONINT(0)
+        )
+    );
+    uint8_t *buffer = NULL;
+    size_t size = 0;
+    const char *expected =
+        "{\"unicodeScalarValues\":0,\"keyCode\":269025042,"
+        "\"scanCode\":121,\"modifiers\":0}";
+
+    TEST_ASSERT_EQUAL_INT(0, platch_encode(&object, &buffer, &size));
+    TEST_ASSERT_EQUAL_size_t(strlen(expected), size);
+    TEST_ASSERT_EQUAL_MEMORY(expected, buffer, size);
+
+    free(buffer);
 }
 
 void test_raw_std_value_is_null() {
@@ -1370,6 +1393,7 @@ void test_raw_std_method_call_get_arg() {
 int main(void) {
     UNITY_BEGIN();
 
+    RUN_TEST(test_json_integer_encoding_preserves_exact_decimal_syntax);
     RUN_TEST(test_raw_std_value_is_null);
     RUN_TEST(test_raw_std_value_is_true);
     RUN_TEST(test_raw_std_value_is_false);

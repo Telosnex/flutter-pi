@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 
 #include <inttypes.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 
@@ -13,7 +14,9 @@
 #include <gst/gstmemory.h>
 #include <gst/gstpad.h>
 #include <gst/video/gstvideometa.h>
+#include <jsc/jsc.h>
 #include <sys/eventfd.h>
+#include <wpe/webkit.h>
 
 #include "flutter-pi.h"
 #include "notifier_listener.h"
@@ -141,7 +144,7 @@ struct gstplayer {
      */
     int64_t desired_position_ms;
 
-    struct notifier video_info_notifier, buffering_state_notifier, error_notifier;
+    struct notifier video_info_notifier, buffering_state_notifier, error_notifier, web_event_notifier;
 
     bool is_initialized;
     bool has_sent_info;
@@ -155,12 +158,329 @@ struct gstplayer {
 
     struct frame_interface *frame_interface;
 
-    GstElement *pipeline, *sink;
+    GstElement *pipeline, *sink, *websrc;
     GstBus *bus;
+
+    GMutex web_lock;
+    GHashTable *pending_web_replies;
+    GAsyncQueue *web_tasks;
+    GThread *web_thread;
+    atomic_bool web_move_pending;
+    uint32_t next_web_call_id;
     sd_event_source *busfd_events;
 
     bool is_live;
 };
+
+struct pending_web_reply {
+    WebKitScriptMessageReply *reply;
+    JSCContext *context;
+    GMainContext *main_context;
+};
+
+struct web_reply_task {
+    struct pending_web_reply *pending;
+    char *result_json;
+    char *error;
+};
+
+enum web_task_type {
+    kWebTaskStop,
+    kWebTaskNavigation,
+    kWebTaskLoadUrl,
+    kWebTaskLoadBytes,
+    kWebTaskRunJavaScript,
+};
+
+enum web_pointer_task_kind {
+    kWebPointerTaskNone,
+    kWebPointerTaskMove,
+};
+
+struct web_task {
+    enum web_task_type type;
+    enum web_pointer_task_kind pointer_kind;
+    GstEvent *navigation_event;
+    GBytes *bytes;
+    char *string;
+};
+
+static gboolean complete_web_reply(void *userdata);
+
+static void destroy_web_task(void *userdata) {
+    struct web_task *task = userdata;
+    if (task == NULL) return;
+    if (task->navigation_event != NULL) gst_event_unref(task->navigation_event);
+    if (task->bytes != NULL) g_bytes_unref(task->bytes);
+    free(task->string);
+    free(task);
+}
+
+static void *run_web_tasks(void *userdata) {
+    struct gstplayer *player = userdata;
+    struct web_task *task;
+
+    for (;;) {
+        task = g_async_queue_pop(player->web_tasks);
+        if (task->type == kWebTaskStop) {
+            destroy_web_task(task);
+            break;
+        }
+
+        switch (task->type) {
+            case kWebTaskNavigation:
+                {
+                    GstNavigationEventType navigation_type = gst_navigation_event_get_type(task->navigation_event);
+                    if (!gst_element_send_event(player->pipeline, task->navigation_event)) {
+                        LOG_ERROR("Could not send navigation event (type %d) upstream through the GStreamer pipeline.\n", (int) navigation_type);
+                    }
+                }
+                // gst_element_send_event consumes the event even on failure.
+                task->navigation_event = NULL;
+                if (task->pointer_kind == kWebPointerTaskMove) {
+                    player->web_move_pending = false;
+                }
+                break;
+            case kWebTaskLoadUrl:
+                g_object_set(G_OBJECT(player->websrc), "location", task->string, NULL);
+                break;
+            case kWebTaskLoadBytes:
+                g_signal_emit_by_name(player->websrc, "load-bytes", task->bytes);
+                break;
+            case kWebTaskRunJavaScript:
+                g_signal_emit_by_name(player->websrc, "run-javascript", task->string);
+                break;
+            case kWebTaskStop: UNREACHABLE();
+        }
+        destroy_web_task(task);
+    }
+    return NULL;
+}
+
+static int enqueue_web_task(struct gstplayer *player, struct web_task *task) {
+    ASSERT_NOT_NULL(player);
+    ASSERT_NOT_NULL(task);
+    if (player->websrc == NULL || player->web_thread == NULL) {
+        destroy_web_task(task);
+        return EOPNOTSUPP;
+    }
+    g_async_queue_push(player->web_tasks, task);
+    return 0;
+}
+
+static const char kWebBridgeScript[] =
+    "(() => {"
+    "if (window.flutter_inappwebview && window.flutter_inappwebview.__telosnexWpeTexture) return;"
+    "Object.defineProperty(window, 'flutter_inappwebview', {"
+    "configurable: true, value: {"
+    "__telosnexWpeTexture: true,"
+    "callHandler(handlerName, ...args) {"
+    "return window.webkit.messageHandlers.telosnex.postMessage("
+    "JSON.stringify({handlerName, args}));"
+    "}"
+    "}"
+    "});"
+    "})();";
+
+static void destroy_web_event(void *value) {
+    struct gstplayer_web_event *event = value;
+    if (event == NULL) return;
+    free(event->url);
+    free(event->message);
+    free(event);
+}
+
+static void destroy_pending_web_reply(void *value) {
+    struct pending_web_reply *pending = value;
+    struct web_reply_task *task;
+    if (pending == NULL) return;
+    task = calloc(1, sizeof(*task));
+    if (task == NULL) return;
+    task->pending = pending;
+    task->error = strdup("The flutter-pi WPE view was disposed.");
+    if (task->error == NULL) {
+        free(task);
+        return;
+    }
+    g_main_context_invoke(pending->main_context, complete_web_reply, task);
+}
+
+static void notify_web_event(
+    struct gstplayer *player,
+    enum gstplayer_web_event_type type,
+    uint32_t call_id,
+    const char *url,
+    const char *message
+) {
+    struct gstplayer_web_event *event = calloc(1, sizeof(*event));
+    if (event == NULL) return;
+    event->type = type;
+    event->call_id = call_id;
+    event->url = url == NULL ? NULL : strdup(url);
+    event->message = message == NULL ? NULL : strdup(message);
+    if ((url != NULL && event->url == NULL) || (message != NULL && event->message == NULL)) {
+        destroy_web_event(event);
+        return;
+    }
+    notifier_notify(&player->web_event_notifier, event);
+}
+
+static void on_web_load_changed(WebKitWebView *webview, WebKitLoadEvent load_event, void *userdata) {
+    struct gstplayer *player = userdata;
+    const char *url = webkit_web_view_get_uri(webview);
+    if (load_event == WEBKIT_LOAD_STARTED) {
+        notify_web_event(player, kGstplayerWebLoadStart, 0, url, NULL);
+    } else if (load_event == WEBKIT_LOAD_FINISHED) {
+        notify_web_event(player, kGstplayerWebLoadStop, 0, url, NULL);
+    }
+}
+
+static gboolean on_web_load_failed(
+    WebKitWebView *webview,
+    WebKitLoadEvent load_event,
+    const char *failing_url,
+    GError *error,
+    void *userdata
+) {
+    struct gstplayer *player = userdata;
+    (void) webview;
+    (void) load_event;
+    if (error != NULL && g_error_matches(error, WEBKIT_NETWORK_ERROR, WEBKIT_NETWORK_ERROR_CANCELLED)) return FALSE;
+    notify_web_event(
+        player,
+        kGstplayerWebLoadError,
+        0,
+        failing_url,
+        error == NULL ? "Unknown WPE load error" : error->message
+    );
+    return FALSE;
+}
+
+static void on_web_javascript_message(WebKitUserContentManager *manager, JSCValue *value, void *userdata) {
+    struct gstplayer *player = userdata;
+    char *message;
+    (void) manager;
+    if (value == NULL) return;
+    message = jsc_value_to_string(value);
+    if (message == NULL) return;
+    notify_web_event(player, kGstplayerWebJavaScriptMessage, 0, NULL, message);
+    g_free(message);
+}
+
+static gboolean on_web_handler_call(
+    WebKitUserContentManager *manager,
+    JSCValue *value,
+    WebKitScriptMessageReply *reply,
+    void *userdata
+) {
+    struct gstplayer *player = userdata;
+    struct pending_web_reply *pending;
+    GMainContext *main_context;
+    JSCContext *context;
+    uint32_t call_id;
+    char *message;
+    (void) manager;
+
+    if (value == NULL || reply == NULL) return FALSE;
+    message = jsc_value_to_string(value);
+    if (message == NULL) return FALSE;
+    context = jsc_value_get_context(value);
+    main_context = g_main_context_get_thread_default();
+    if (context == NULL || main_context == NULL) {
+        g_free(message);
+        return FALSE;
+    }
+
+    pending = calloc(1, sizeof(*pending));
+    if (pending == NULL) {
+        g_free(message);
+        return FALSE;
+    }
+    pending->reply = webkit_script_message_reply_ref(reply);
+    pending->context = JSC_CONTEXT(g_object_ref(context));
+    pending->main_context = g_main_context_ref(main_context);
+
+    g_mutex_lock(&player->web_lock);
+    call_id = player->next_web_call_id++;
+    if (call_id == 0) call_id = player->next_web_call_id++;
+    g_hash_table_insert(player->pending_web_replies, GUINT_TO_POINTER(call_id), pending);
+    g_mutex_unlock(&player->web_lock);
+
+    notify_web_event(player, kGstplayerWebHandlerCall, call_id, NULL, message);
+    g_free(message);
+    return TRUE;
+}
+
+static void on_configure_web_view(GstElement *websrc, GObject *object, void *userdata) {
+    struct gstplayer *player = userdata;
+    WebKitUserContentManager *manager;
+    WebKitUserScript *script;
+    WebKitWebView *webview = WEBKIT_WEB_VIEW(object);
+    (void) websrc;
+
+    manager = webkit_web_view_get_user_content_manager(webview);
+    if (manager == NULL) {
+        LOG_ERROR("Could not get the WPE WebKit user content manager.\n");
+        return;
+    }
+
+    g_signal_connect(webview, "load-changed", G_CALLBACK(on_web_load_changed), player);
+    g_signal_connect(webview, "load-failed", G_CALLBACK(on_web_load_failed), player);
+    g_signal_connect(
+        manager,
+        "script-message-with-reply-received::telosnex",
+        G_CALLBACK(on_web_handler_call),
+        player
+    );
+    g_signal_connect(
+        manager,
+        "script-message-received::telosnexEvents",
+        G_CALLBACK(on_web_javascript_message),
+        player
+    );
+
+    if (!webkit_user_content_manager_register_script_message_handler_with_reply(manager, "telosnex", NULL) ||
+        !webkit_user_content_manager_register_script_message_handler(manager, "telosnexEvents", NULL)) {
+        LOG_ERROR("Could not register the WPE WebKit JavaScript bridge.\n");
+        return;
+    }
+
+    script = webkit_user_script_new(
+        kWebBridgeScript,
+        WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES,
+        WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START,
+        NULL,
+        NULL
+    );
+    webkit_user_content_manager_add_script(manager, script);
+    webkit_user_script_unref(script);
+}
+
+static gboolean complete_web_reply(void *userdata) {
+    struct web_reply_task *task = userdata;
+    JSCValue *value;
+
+    if (task->error != NULL) {
+        webkit_script_message_reply_return_error_message(task->pending->reply, task->error);
+    } else {
+        value = jsc_value_new_from_json(
+            task->pending->context,
+            task->result_json == NULL ? "null" : task->result_json
+        );
+        if (value == NULL) value = jsc_value_new_null(task->pending->context);
+        webkit_script_message_reply_return_value(task->pending->reply, value);
+        g_object_unref(value);
+    }
+
+    webkit_script_message_reply_unref(task->pending->reply);
+    g_object_unref(task->pending->context);
+    g_main_context_unref(task->pending->main_context);
+    free(task->pending);
+    free(task->result_json);
+    free(task->error);
+    free(task);
+    return G_SOURCE_REMOVE;
+}
 
 #define MAX_N_PLANES 4
 #define MAX_N_EGL_DMABUF_IMAGE_ATTRIBUTES 6 + 6 * MAX_N_PLANES + 1
@@ -763,8 +1083,7 @@ static GstFlowReturn on_appsink_new_preroll(GstAppSink *appsink, void *userdata)
 
     sample = gst_app_sink_try_pull_preroll(appsink, 0);
     if (sample == NULL) {
-        LOG_ERROR("gstreamer returned a NULL sample.\n");
-        return GST_FLOW_ERROR;
+        return GST_FLOW_FLUSHING;
     }
 
     /// TODO: Attempt to upload using gst_gl_upload here
@@ -799,8 +1118,7 @@ static GstFlowReturn on_appsink_new_sample(GstAppSink *appsink, void *userdata) 
     /// TODO: Attempt to upload using gst_gl_upload here
     sample = gst_app_sink_try_pull_sample(appsink, 0);
     if (sample == NULL) {
-        LOG_ERROR("gstreamer returned a NULL sample.\n");
-        return GST_FLOW_ERROR;
+        return GST_FLOW_FLUSHING;
     }
 
     frame = frame_new(player->frame_interface, sample, player->has_gst_info ? &player->gst_info : NULL);
@@ -845,7 +1163,7 @@ void on_source_setup(GstElement *bin, GstElement *source, gpointer userdata) {
 static int init(struct gstplayer *player, bool force_sw_decoders) {
     GstStateChangeReturn state_change_return;
     sd_event_source *busfd_event_source;
-    GstElement *pipeline, *sink, *src;
+    GstElement *pipeline, *sink, *src, *websrc;
     GstBus *bus;
     GstPad *pad;
     GPollFD fd;
@@ -884,6 +1202,16 @@ static int init(struct gstplayer *player, bool force_sw_decoders) {
     gst_pad_add_probe(pad, GST_PAD_PROBE_TYPE_QUERY_DOWNSTREAM, on_query_appsink, player, NULL);
 
     src = gst_bin_get_by_name(GST_BIN(pipeline), "src");
+    websrc = gst_bin_get_by_name(GST_BIN(pipeline), "websrc");
+    if (websrc != NULL) {
+        if (g_signal_lookup("configure-web-view", G_OBJECT_TYPE(websrc)) == 0) {
+            LOG_ERROR("The element named \"websrc\" is not a configurable WPE video source.\n");
+            gst_object_unref(websrc);
+            websrc = NULL;
+        } else {
+            g_signal_connect(websrc, "configure-web-view", G_CALLBACK(on_configure_web_view), player);
+        }
+    }
 
     if (player->video_uri != NULL) {
         if (src != NULL) {
@@ -901,20 +1229,23 @@ static int init(struct gstplayer *player, bool force_sw_decoders) {
         }
     }
 
-    if (player->headers != NULL) {
-        if (src != NULL) {
+    if (player->headers != NULL && gst_structure_n_fields(player->headers) > 0) {
+        if (src != NULL && g_signal_lookup("source-setup", G_OBJECT_TYPE(src)) != 0) {
             g_signal_connect(G_OBJECT(src), "source-setup", G_CALLBACK(on_source_setup), player->headers);
         } else {
-            LOG_ERROR("Couldn't find \"src\" element to configure additional HTTP headers.\n");
+            LOG_ERROR("Couldn't configure HTTP headers on the GStreamer source element.\n");
         }
     }
 
-    gst_base_sink_set_max_lateness(GST_BASE_SINK(sink), 20 * GST_MSECOND);
-    gst_base_sink_set_qos_enabled(GST_BASE_SINK(sink), TRUE);
-    gst_base_sink_set_sync(GST_BASE_SINK(sink), TRUE);
-    gst_app_sink_set_max_buffers(GST_APP_SINK(sink), 2);
+    if (player->pipeline_description == NULL) {
+        gst_base_sink_set_max_lateness(GST_BASE_SINK(sink), 20 * GST_MSECOND);
+        gst_base_sink_set_qos_enabled(GST_BASE_SINK(sink), TRUE);
+        gst_base_sink_set_sync(GST_BASE_SINK(sink), TRUE);
+        gst_app_sink_set_max_buffers(GST_APP_SINK(sink), 2);
+        gst_app_sink_set_drop(GST_APP_SINK(sink), FALSE);
+    }
+    // Custom pipelines own their sink timing and backpressure policy.
     gst_app_sink_set_emit_signals(GST_APP_SINK(sink), TRUE);
-    gst_app_sink_set_drop(GST_APP_SINK(sink), FALSE);
 
     // configure our caps
     // we only accept video formats that we can actually upload to EGL
@@ -969,11 +1300,15 @@ static int init(struct gstplayer *player, bool force_sw_decoders) {
     }
 
     player->sink = sink;
+    player->websrc = websrc;
     /// FIXME: Not sure we need this here. pipeline is floating after gst_parse_launch, which
     /// means we should take a reference, but the examples don't increase the refcount.
     player->pipeline = pipeline;  //gst_object_ref(pipeline);
     player->bus = bus;
     player->busfd_events = busfd_event_source;
+    if (websrc != NULL) {
+        player->web_thread = g_thread_new("flutterpi-wpe", run_web_tasks, player);
+    }
 
     gst_object_unref(pad);
     return 0;
@@ -988,6 +1323,13 @@ fail_unref_pipeline:
 }
 
 static void maybe_deinit(struct gstplayer *player) {
+    if (player->web_thread != NULL) {
+        struct web_task *stop = g_new0(struct web_task, 1);
+        stop->type = kWebTaskStop;
+        g_async_queue_push(player->web_tasks, stop);
+        g_thread_join(player->web_thread);
+        player->web_thread = NULL;
+    }
     if (player->busfd_events != NULL) {
         sd_event_source_unrefp(&player->busfd_events);
     }
@@ -1004,6 +1346,10 @@ static void maybe_deinit(struct gstplayer *player) {
         gst_element_set_state(GST_ELEMENT(player->pipeline), GST_STATE_NULL);
         gst_object_unref(GST_OBJECT(player->pipeline));
         player->pipeline = NULL;
+    }
+    if (player->websrc != NULL) {
+        gst_object_unref(GST_OBJECT(player->websrc));
+        player->websrc = NULL;
     }
 }
 
@@ -1069,6 +1415,18 @@ static struct gstplayer *gstplayer_new(struct flutterpi *flutterpi, const char *
     if (ok != 0)
         goto fail_deinit_buffering_state_notifier;
 
+    ok = value_notifier_init(&player->web_event_notifier, NULL, destroy_web_event);
+    if (ok != 0)
+        goto fail_deinit_error_notifier;
+
+    g_mutex_init(&player->web_lock);
+    player->pending_web_replies = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, destroy_pending_web_reply);
+    if (player->pending_web_replies == NULL)
+        goto fail_deinit_web_resources;
+    player->web_tasks = g_async_queue_new_full(destroy_web_task);
+    if (player->web_tasks == NULL)
+        goto fail_unref_pending_web_replies;
+
     player->flutterpi = flutterpi;
     player->userdata = userdata;
     player->video_uri = uri_owned;
@@ -1095,13 +1453,24 @@ static struct gstplayer *gstplayer_new(struct flutterpi *flutterpi, const char *
     player->frame_interface = frame_interface;
     player->pipeline = NULL;
     player->sink = NULL;
+    player->websrc = NULL;
     player->bus = NULL;
+    player->web_thread = NULL;
+    player->web_move_pending = false;
+    player->next_web_call_id = 1;
     player->busfd_events = NULL;
     player->is_live = false;
     return player;
 
-    //fail_deinit_error_notifier:
-    //notifier_deinit(&player->error_notifier);
+fail_unref_pending_web_replies:
+    g_hash_table_unref(player->pending_web_replies);
+
+fail_deinit_web_resources:
+    g_mutex_clear(&player->web_lock);
+    notifier_deinit(&player->web_event_notifier);
+
+fail_deinit_error_notifier:
+    notifier_deinit(&player->error_notifier);
 
 fail_deinit_buffering_state_notifier:
     notifier_deinit(&player->buffering_state_notifier);
@@ -1166,10 +1535,14 @@ struct gstplayer *gstplayer_new_from_pipeline(struct flutterpi *flutterpi, const
 
 void gstplayer_destroy(struct gstplayer *player) {
     LOG_DEBUG("gstplayer_destroy(%p)\n", player);
+    maybe_deinit(player);
     notifier_deinit(&player->video_info_notifier);
     notifier_deinit(&player->buffering_state_notifier);
     notifier_deinit(&player->error_notifier);
-    maybe_deinit(player);
+    notifier_deinit(&player->web_event_notifier);
+    g_hash_table_unref(player->pending_web_replies);
+    g_async_queue_unref(player->web_tasks);
+    g_mutex_clear(&player->web_lock);
     pthread_mutex_destroy(&player->lock);
     if (player->headers != NULL) {
         gst_structure_free(player->headers);
@@ -1302,6 +1675,125 @@ int gstplayer_step_forward(struct gstplayer *player) {
     return 0;
 }
 
+int gstplayer_send_navigation_event(struct gstplayer *player, GstEvent *event) {
+    enum web_pointer_task_kind pointer_kind = kWebPointerTaskNone;
+    struct web_task *task;
+    int ok;
+
+    ASSERT_NOT_NULL(player);
+    ASSERT_NOT_NULL(event);
+
+    switch (gst_navigation_event_get_type(event)) {
+        case GST_NAVIGATION_EVENT_MOUSE_MOVE:
+            pointer_kind = kWebPointerTaskMove;
+            if (atomic_exchange(&player->web_move_pending, true)) {
+                gst_event_unref(event);
+                return 0;
+            }
+            break;
+        default: break;
+    }
+
+    task = calloc(1, sizeof(*task));
+    if (task == NULL) {
+        if (pointer_kind == kWebPointerTaskMove) player->web_move_pending = false;
+        gst_event_unref(event);
+        return ENOMEM;
+    }
+    task->type = kWebTaskNavigation;
+    task->pointer_kind = pointer_kind;
+    task->navigation_event = event;
+    ok = enqueue_web_task(player, task);
+    if (ok != 0 && pointer_kind == kWebPointerTaskMove) {
+        player->web_move_pending = false;
+    }
+    return ok;
+}
+
+int gstplayer_web_load_url(struct gstplayer *player, const char *url) {
+    struct web_task *task;
+    ASSERT_NOT_NULL(player);
+    ASSERT_NOT_NULL(url);
+
+    task = calloc(1, sizeof(*task));
+    if (task == NULL) return ENOMEM;
+    task->type = kWebTaskLoadUrl;
+    task->string = strdup(url);
+    if (task->string == NULL) {
+        destroy_web_task(task);
+        return ENOMEM;
+    }
+    return enqueue_web_task(player, task);
+}
+
+int gstplayer_web_load_bytes(struct gstplayer *player, const uint8_t *data, size_t size) {
+    struct web_task *task;
+    ASSERT_NOT_NULL(player);
+
+    task = calloc(1, sizeof(*task));
+    if (task == NULL) return ENOMEM;
+    task->type = kWebTaskLoadBytes;
+    task->bytes = g_bytes_new(data, size);
+    if (task->bytes == NULL) {
+        destroy_web_task(task);
+        return ENOMEM;
+    }
+    return enqueue_web_task(player, task);
+}
+
+int gstplayer_web_run_javascript(struct gstplayer *player, const char *source) {
+    struct web_task *task;
+    ASSERT_NOT_NULL(player);
+    ASSERT_NOT_NULL(source);
+
+    task = calloc(1, sizeof(*task));
+    if (task == NULL) return ENOMEM;
+    task->type = kWebTaskRunJavaScript;
+    task->string = strdup(source);
+    if (task->string == NULL) {
+        destroy_web_task(task);
+        return ENOMEM;
+    }
+    return enqueue_web_task(player, task);
+}
+
+int gstplayer_web_respond_to_handler(
+    struct gstplayer *player,
+    uint32_t call_id,
+    const char *result_json,
+    const char *error
+) {
+    struct pending_web_reply *pending;
+    struct web_reply_task *task;
+
+    ASSERT_NOT_NULL(player);
+    task = calloc(1, sizeof(*task));
+    if (task == NULL) return ENOMEM;
+    task->result_json = result_json == NULL ? NULL : strdup(result_json);
+    task->error = error == NULL ? NULL : strdup(error);
+    if ((result_json != NULL && task->result_json == NULL) || (error != NULL && task->error == NULL)) {
+        free(task->result_json);
+        free(task->error);
+        free(task);
+        return ENOMEM;
+    }
+
+    g_mutex_lock(&player->web_lock);
+    pending = g_hash_table_lookup(player->pending_web_replies, GUINT_TO_POINTER(call_id));
+    if (pending != NULL) g_hash_table_steal(player->pending_web_replies, GUINT_TO_POINTER(call_id));
+    g_mutex_unlock(&player->web_lock);
+    if (pending == NULL) {
+        free(task->result_json);
+        free(task->error);
+        free(task);
+        return ENOENT;
+    }
+
+    task->pending = pending;
+    g_main_context_invoke(pending->main_context, complete_web_reply, task);
+    return 0;
+}
+
 int gstplayer_step_backward(struct gstplayer *player) {
     gboolean gst_ok;
     int ok;
@@ -1322,6 +1814,10 @@ int gstplayer_step_backward(struct gstplayer *player) {
     }
 
     return 0;
+}
+
+struct notifier *gstplayer_get_web_event_notifier(struct gstplayer *player) {
+    return &player->web_event_notifier;
 }
 
 struct notifier *gstplayer_get_video_info_notifier(struct gstplayer *player) {

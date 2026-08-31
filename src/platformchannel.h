@@ -38,11 +38,12 @@
  * need to be rewritten every time they do. The handlers not needing to be rewritten would probably be the only advantage
  * of using a unified message value type.
  */
-enum json_value_type { kJsonNull, kJsonTrue, kJsonFalse, kJsonNumber, kJsonString, kJsonArray, kJsonObject };
+enum json_value_type { kJsonNull, kJsonTrue, kJsonFalse, kJsonNumber, kJsonString, kJsonArray, kJsonObject, kJsonInteger };
 struct json_value {
     enum json_value_type type;
     union {
         double number_value;
+        int64_t integer_value;
         char *string_value;
         struct {
             size_t size;
@@ -715,9 +716,10 @@ struct std_value {
 #define JSONVALUE_AS_BOOL(value) ((value).type == kJsonTrue)
 #define JSONBOOL(bool_value) ((struct json_value){ .type = (bool_value) ? kJsonTrue : kJsonFalse })
 
-#define JSONVALUE_IS_NUM(value) ((value).type == kJsonNumber)
-#define JSONVALUE_AS_NUM(value) ((value).number_value)
+#define JSONVALUE_IS_NUM(value) (((value).type == kJsonNumber) || ((value).type == kJsonInteger))
+#define JSONVALUE_AS_NUM(value) ((value).type == kJsonInteger ? (double) (value).integer_value : (value).number_value)
 #define JSONNUM(_number_value) ((struct json_value){ .type = kJsonNumber, .number_value = (_number_value) })
+#define JSONINT(_integer_value) ((struct json_value){ .type = kJsonInteger, .integer_value = (_integer_value) })
 
 #define JSONVALUE_IS_STRING(value) ((value).type == kJsonString)
 #define JSONVALUE_AS_STRING(value) ((value).string_value)

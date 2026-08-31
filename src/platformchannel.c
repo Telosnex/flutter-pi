@@ -3,6 +3,7 @@
 #include <assert.h>
 #include <ctype.h>
 #include <errno.h>
+#include <inttypes.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -438,6 +439,7 @@ size_t platch_calc_value_size_json(struct json_value *value) {
         case kJsonTrue: return 4;
         case kJsonFalse: return 5;
         case kJsonNumber:; char numBuffer[32]; return sprintf(numBuffer, "%g", value->number_value);
+        case kJsonInteger:; char integerBuffer[32]; return sprintf(integerBuffer, "%" PRId64, value->integer_value);
         case kJsonString:
             size = 2;
 
@@ -483,6 +485,7 @@ int platch_write_value_to_buffer_json(struct json_value *value, uint8_t **pbuffe
         case kJsonTrue: *pbuffer += sprintf((char *) *pbuffer, "true"); break;
         case kJsonFalse: *pbuffer += sprintf((char *) *pbuffer, "false"); break;
         case kJsonNumber: *pbuffer += sprintf((char *) *pbuffer, "%g", value->number_value); break;
+        case kJsonInteger: *pbuffer += sprintf((char *) *pbuffer, "%" PRId64, value->integer_value); break;
         case kJsonString:
             *((*pbuffer)++) = '\"';
 
@@ -1488,6 +1491,7 @@ bool jsvalue_equals(struct json_value *a, struct json_value *b) {
         case kJsonTrue:
         case kJsonFalse: return true;
         case kJsonNumber: return a->number_value == b->number_value;
+        case kJsonInteger: return a->integer_value == b->integer_value;
         case kJsonString: return streq(a->string_value, b->string_value);
         case kJsonArray:
             if (a->size != b->size)

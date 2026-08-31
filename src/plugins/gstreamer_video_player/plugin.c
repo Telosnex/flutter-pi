@@ -8,6 +8,7 @@
 #include <pthread.h>
 
 #include <gst/gst.h>
+#include <gst/video/navigation.h>
 #include <gst/video/video-info.h>
 
 #include "flutter-pi.h"
@@ -44,6 +45,7 @@ struct gstplayer_meta {
 
     struct listener *video_info_listener;
     struct listener *buffering_state_listener;
+    struct listener *web_event_listener;
 };
 
 static struct plugin {
@@ -352,6 +354,77 @@ static enum listener_return on_buffering_state_notify(void *arg, void *userdata)
     return kNoAction;
 }
 
+static enum listener_return on_web_event_notify(void *arg, void *userdata) {
+    struct gstplayer_web_event *event = arg;
+    struct gstplayer_meta *meta = userdata;
+
+    ASSERT_NOT_NULL(userdata);
+    if (event == NULL) return kNoAction;
+
+    switch (event->type) {
+        case kGstplayerWebLoadStart:
+            platch_send_success_event_std(
+                meta->event_channel_name,
+                &STDMAP2(
+                    STDSTRING("event"),
+                    STDSTRING("webLoadStart"),
+                    STDSTRING("url"),
+                    event->url == NULL ? STDNULL : STDSTRING(event->url)
+                )
+            );
+            break;
+        case kGstplayerWebLoadStop:
+            platch_send_success_event_std(
+                meta->event_channel_name,
+                &STDMAP2(
+                    STDSTRING("event"),
+                    STDSTRING("webLoadStop"),
+                    STDSTRING("url"),
+                    event->url == NULL ? STDNULL : STDSTRING(event->url)
+                )
+            );
+            break;
+        case kGstplayerWebLoadError:
+            platch_send_success_event_std(
+                meta->event_channel_name,
+                &STDMAP3(
+                    STDSTRING("event"),
+                    STDSTRING("webLoadError"),
+                    STDSTRING("url"),
+                    event->url == NULL ? STDNULL : STDSTRING(event->url),
+                    STDSTRING("message"),
+                    event->message == NULL ? STDSTRING("Unknown WPE load error") : STDSTRING(event->message)
+                )
+            );
+            break;
+        case kGstplayerWebHandlerCall:
+            platch_send_success_event_std(
+                meta->event_channel_name,
+                &STDMAP3(
+                    STDSTRING("event"),
+                    STDSTRING("webHandlerCall"),
+                    STDSTRING("callId"),
+                    STDINT64(event->call_id),
+                    STDSTRING("message"),
+                    event->message == NULL ? STDSTRING("{}") : STDSTRING(event->message)
+                )
+            );
+            break;
+        case kGstplayerWebJavaScriptMessage:
+            platch_send_success_event_std(
+                meta->event_channel_name,
+                &STDMAP2(
+                    STDSTRING("event"),
+                    STDSTRING("webJavaScriptMessage"),
+                    STDSTRING("message"),
+                    event->message == NULL ? STDSTRING("{}") : STDSTRING(event->message)
+                )
+            );
+            break;
+    }
+    return kNoAction;
+}
+
 /*******************************************************
  * CHANNEL HANDLERS                                    *
  * handle method calls on the method and event channel *
@@ -382,6 +455,11 @@ static int on_receive_evch(char *channel, struct platch_obj *object, FlutterPlat
         if (meta->buffering_state_listener == NULL) {
             LOG_ERROR("Couldn't listen for buffering events in gstplayer.\n");
         }
+        meta->web_event_listener =
+            notifier_listen(gstplayer_get_web_event_notifier(player), on_web_event_notify, NULL, meta);
+        if (meta->web_event_listener == NULL) {
+            LOG_ERROR("Couldn't listen for WPE WebKit events in gstplayer.\n");
+        }
     } else if (streq("cancel", method)) {
         platch_respond_success_std(responsehandle, NULL);
         meta->has_listener = false;
@@ -393,6 +471,10 @@ static int on_receive_evch(char *channel, struct platch_obj *object, FlutterPlat
         if (meta->buffering_state_listener != NULL) {
             notifier_unlisten(gstplayer_get_buffering_state_notifier(player), meta->buffering_state_listener);
             meta->buffering_state_listener = NULL;
+        }
+        if (meta->web_event_listener != NULL) {
+            notifier_unlisten(gstplayer_get_web_event_notifier(player), meta->web_event_listener);
+            meta->web_event_listener = NULL;
         }
     } else {
         return platch_respond_not_implemented(responsehandle);
@@ -496,6 +578,9 @@ static struct gstplayer_meta *create_meta(int64_t texture_id, struct gstplayer *
     meta->event_channel_name = event_channel_name;
     meta->has_listener = false;
     meta->is_buffering = false;
+    meta->video_info_listener = NULL;
+    meta->buffering_state_listener = NULL;
+    meta->web_event_listener = NULL;
     return meta;
 }
 
@@ -528,6 +613,10 @@ static void dispose_player(struct gstplayer *player, bool plugin_registry_locked
     if (meta->buffering_state_listener != NULL) {
         notifier_unlisten(gstplayer_get_buffering_state_notifier(player), meta->buffering_state_listener);
         meta->buffering_state_listener = NULL;
+    }
+    if (meta->web_event_listener != NULL) {
+        notifier_unlisten(gstplayer_get_web_event_notifier(player), meta->web_event_listener);
+        meta->web_event_listener = NULL;
     }
 
     destroy_meta(meta);
@@ -1519,6 +1608,223 @@ static int on_step_forward_v2(const struct raw_std_value *arg, FlutterPlatformMe
     return platch_respond_success_std(responsehandle, &STDNULL);
 }
 
+static int on_web_pointer_event_v2(const struct raw_std_value *arg, FlutterPlatformMessageResponseHandle *responsehandle) {
+    const struct raw_std_value *type, *x_value, *y_value, *button_value, *delta_x_value, *delta_y_value, *modifiers_value;
+    GstNavigationModifierType modifiers;
+    struct gstplayer *player;
+    GstEvent *event;
+    double x, y, delta_x, delta_y;
+    int button, ok;
+
+    ok = check_arg_is_minimum_sized_list(arg, 8, responsehandle);
+    if (ok != 0) return 0;
+
+    player = get_player_from_v2_list_arg(arg, responsehandle);
+    if (player == NULL) return 0;
+
+    type = raw_std_list_get_nth_element(arg, 1);
+    x_value = raw_std_list_get_nth_element(arg, 2);
+    y_value = raw_std_list_get_nth_element(arg, 3);
+    button_value = raw_std_list_get_nth_element(arg, 4);
+    delta_x_value = raw_std_list_get_nth_element(arg, 5);
+    delta_y_value = raw_std_list_get_nth_element(arg, 6);
+    modifiers_value = raw_std_list_get_nth_element(arg, 7);
+
+    if (!raw_std_value_is_string(type) || !raw_std_value_is_float64(x_value) || !raw_std_value_is_float64(y_value) ||
+        !raw_std_value_is_int(button_value) || !raw_std_value_is_float64(delta_x_value) ||
+        !raw_std_value_is_float64(delta_y_value) || !raw_std_value_is_int(modifiers_value)) {
+        return platch_respond_illegal_arg_std(responsehandle, "Invalid web pointer event arguments.");
+    }
+
+    x = raw_std_value_as_float64(x_value);
+    y = raw_std_value_as_float64(y_value);
+    button = raw_std_value_as_int(button_value);
+    delta_x = raw_std_value_as_float64(delta_x_value);
+    delta_y = raw_std_value_as_float64(delta_y_value);
+    modifiers = (GstNavigationModifierType) raw_std_value_as_int(modifiers_value);
+
+    if (raw_std_string_equals(type, "move")) {
+        event = gst_navigation_event_new_mouse_move(x, y, modifiers);
+    } else if (raw_std_string_equals(type, "down")) {
+        event = gst_navigation_event_new_mouse_button_press(button, x, y, modifiers);
+    } else if (raw_std_string_equals(type, "up")) {
+        event = gst_navigation_event_new_mouse_button_release(button, x, y, modifiers);
+    } else if (raw_std_string_equals(type, "scroll")) {
+        event = gst_navigation_event_new_mouse_scroll(x, y, delta_x, delta_y, modifiers);
+    } else if (raw_std_string_equals(type, "touchDown")) {
+        // `button` carries the touch identifier for touch event types.
+        event = gst_navigation_event_new_touch_down((guint) button, x, y, 1.0, modifiers);
+    } else if (raw_std_string_equals(type, "touchMove")) {
+        event = gst_navigation_event_new_touch_motion((guint) button, x, y, 1.0, modifiers);
+    } else if (raw_std_string_equals(type, "touchUp")) {
+        event = gst_navigation_event_new_touch_up((guint) button, x, y, modifiers);
+    } else {
+        return platch_respond_illegal_arg_std(responsehandle, "Unknown web pointer event type.");
+    }
+
+    ok = gstplayer_send_navigation_event(player, event);
+    if (ok != 0) return platch_respond_native_error_std(responsehandle, ok);
+
+    // wpevideosrc only dispatches accumulated touch points to WPE WebKit when
+    // it receives a touch-frame navigation event, so send one after every
+    // touch event. WebKit's TouchGestureController then performs tap/pan
+    // disambiguation and converts drags into pixel-accurate smooth axis
+    // events, which is what makes touch scrolling track the finger.
+    if (raw_std_string_equals(type, "touchDown") || raw_std_string_equals(type, "touchMove") ||
+        raw_std_string_equals(type, "touchUp")) {
+        event = gst_navigation_event_new_touch_frame(modifiers);
+        ok = gstplayer_send_navigation_event(player, event);
+        if (ok != 0) return platch_respond_native_error_std(responsehandle, ok);
+    }
+
+    return platch_respond_success_std(responsehandle, &STDNULL);
+}
+
+static int on_web_key_event_v2(const struct raw_std_value *arg, FlutterPlatformMessageResponseHandle *responsehandle) {
+    const struct raw_std_value *type, *key_value, *modifiers_value;
+    GstNavigationModifierType modifiers;
+    struct gstplayer *player;
+    GstEvent *event;
+    char *key;
+    int ok;
+
+    ok = check_arg_is_minimum_sized_list(arg, 4, responsehandle);
+    if (ok != 0) return 0;
+
+    player = get_player_from_v2_list_arg(arg, responsehandle);
+    if (player == NULL) return 0;
+
+    type = raw_std_list_get_nth_element(arg, 1);
+    key_value = raw_std_list_get_nth_element(arg, 2);
+    modifiers_value = raw_std_list_get_nth_element(arg, 3);
+    if (!raw_std_value_is_string(type) || !raw_std_value_is_string(key_value) || !raw_std_value_is_int(modifiers_value)) {
+        return platch_respond_illegal_arg_std(responsehandle, "Invalid web key event arguments.");
+    }
+
+    key = raw_std_string_dup(key_value);
+    if (key == NULL) return platch_respond_native_error_std(responsehandle, ENOMEM);
+    modifiers = (GstNavigationModifierType) raw_std_value_as_int(modifiers_value);
+
+    if (raw_std_string_equals(type, "down")) {
+        event = gst_navigation_event_new_key_press(key, modifiers);
+    } else if (raw_std_string_equals(type, "up")) {
+        event = gst_navigation_event_new_key_release(key, modifiers);
+    } else {
+        free(key);
+        return platch_respond_illegal_arg_std(responsehandle, "Unknown web key event type.");
+    }
+    free(key);
+
+    ok = gstplayer_send_navigation_event(player, event);
+    if (ok != 0) return platch_respond_native_error_std(responsehandle, ok);
+    return platch_respond_success_std(responsehandle, &STDNULL);
+}
+
+static int on_web_load_url_v2(const struct raw_std_value *arg, FlutterPlatformMessageResponseHandle *responsehandle) {
+    const struct raw_std_value *url_value;
+    struct gstplayer *player;
+    char *url;
+    int ok;
+
+    ok = check_arg_is_minimum_sized_list(arg, 2, responsehandle);
+    if (ok != 0) return 0;
+    player = get_player_from_v2_list_arg(arg, responsehandle);
+    if (player == NULL) return 0;
+    url_value = raw_std_list_get_nth_element(arg, 1);
+    if (!raw_std_value_is_string(url_value)) {
+        return platch_respond_illegal_arg_std(responsehandle, "Expected `arg[1]` to be a URL string.");
+    }
+    url = raw_std_string_dup(url_value);
+    if (url == NULL) return platch_respond_native_error_std(responsehandle, ENOMEM);
+    ok = gstplayer_web_load_url(player, url);
+    free(url);
+    if (ok != 0) return platch_respond_native_error_std(responsehandle, ok);
+    return platch_respond_success_std(responsehandle, &STDNULL);
+}
+
+static int on_web_load_bytes_v2(const struct raw_std_value *arg, FlutterPlatformMessageResponseHandle *responsehandle) {
+    const struct raw_std_value *bytes_value;
+    struct gstplayer *player;
+    int ok;
+
+    ok = check_arg_is_minimum_sized_list(arg, 2, responsehandle);
+    if (ok != 0) return 0;
+    player = get_player_from_v2_list_arg(arg, responsehandle);
+    if (player == NULL) return 0;
+    bytes_value = raw_std_list_get_nth_element(arg, 1);
+    if (!raw_std_value_is_uint8array(bytes_value)) {
+        return platch_respond_illegal_arg_std(responsehandle, "Expected `arg[1]` to be a byte array.");
+    }
+    ok = gstplayer_web_load_bytes(
+        player,
+        raw_std_value_as_uint8array(bytes_value),
+        raw_std_value_get_size(bytes_value)
+    );
+    if (ok != 0) return platch_respond_native_error_std(responsehandle, ok);
+    return platch_respond_success_std(responsehandle, &STDNULL);
+}
+
+static int on_web_run_javascript_v2(
+    const struct raw_std_value *arg,
+    FlutterPlatformMessageResponseHandle *responsehandle
+) {
+    const struct raw_std_value *source_value;
+    struct gstplayer *player;
+    char *source;
+    int ok;
+
+    ok = check_arg_is_minimum_sized_list(arg, 2, responsehandle);
+    if (ok != 0) return 0;
+    player = get_player_from_v2_list_arg(arg, responsehandle);
+    if (player == NULL) return 0;
+    source_value = raw_std_list_get_nth_element(arg, 1);
+    if (!raw_std_value_is_string(source_value)) {
+        return platch_respond_illegal_arg_std(responsehandle, "Expected `arg[1]` to be JavaScript source.");
+    }
+    source = raw_std_string_dup(source_value);
+    if (source == NULL) return platch_respond_native_error_std(responsehandle, ENOMEM);
+    ok = gstplayer_web_run_javascript(player, source);
+    free(source);
+    if (ok != 0) return platch_respond_native_error_std(responsehandle, ok);
+    return platch_respond_success_std(responsehandle, &STDNULL);
+}
+
+static int on_web_handler_response_v2(
+    const struct raw_std_value *arg,
+    FlutterPlatformMessageResponseHandle *responsehandle
+) {
+    const struct raw_std_value *call_id_value, *result_value, *error_value;
+    struct gstplayer *player;
+    char *result = NULL, *error = NULL;
+    int ok;
+
+    ok = check_arg_is_minimum_sized_list(arg, 4, responsehandle);
+    if (ok != 0) return 0;
+    player = get_player_from_v2_list_arg(arg, responsehandle);
+    if (player == NULL) return 0;
+    call_id_value = raw_std_list_get_nth_element(arg, 1);
+    result_value = raw_std_list_get_nth_element(arg, 2);
+    error_value = raw_std_list_get_nth_element(arg, 3);
+    if (!raw_std_value_is_int(call_id_value) ||
+        (!raw_std_value_is_null(result_value) && !raw_std_value_is_string(result_value)) ||
+        (!raw_std_value_is_null(error_value) && !raw_std_value_is_string(error_value))) {
+        return platch_respond_illegal_arg_std(responsehandle, "Invalid WPE JavaScript handler response.");
+    }
+    if (raw_std_value_is_string(result_value)) result = raw_std_string_dup(result_value);
+    if (raw_std_value_is_string(error_value)) error = raw_std_string_dup(error_value);
+    if ((raw_std_value_is_string(result_value) && result == NULL) ||
+        (raw_std_value_is_string(error_value) && error == NULL)) {
+        free(result);
+        free(error);
+        return platch_respond_native_error_std(responsehandle, ENOMEM);
+    }
+    ok = gstplayer_web_respond_to_handler(player, raw_std_value_as_int(call_id_value), result, error);
+    free(result);
+    free(error);
+    if (ok != 0) return platch_respond_native_error_std(responsehandle, ok);
+    return platch_respond_success_std(responsehandle, &STDNULL);
+}
+
 static int on_step_backward_v2(const struct raw_std_value *arg, FlutterPlatformMessageResponseHandle *responsehandle) {
     struct gstplayer *player;
     int ok;
@@ -1583,6 +1889,18 @@ static int on_receive_method_channel_v2(char *channel, struct platch_obj *object
         return on_step_backward_v2(arg, responsehandle);
     } else if (raw_std_string_equals(method, "fastSeek")) {
         return on_fast_seek_v2(arg, responsehandle);
+    } else if (raw_std_string_equals(method, "webPointerEvent")) {
+        return on_web_pointer_event_v2(arg, responsehandle);
+    } else if (raw_std_string_equals(method, "webKeyEvent")) {
+        return on_web_key_event_v2(arg, responsehandle);
+    } else if (raw_std_string_equals(method, "webLoadUrl")) {
+        return on_web_load_url_v2(arg, responsehandle);
+    } else if (raw_std_string_equals(method, "webLoadBytes")) {
+        return on_web_load_bytes_v2(arg, responsehandle);
+    } else if (raw_std_string_equals(method, "webRunJavaScript")) {
+        return on_web_run_javascript_v2(arg, responsehandle);
+    } else if (raw_std_string_equals(method, "webHandlerResponse")) {
+        return on_web_handler_response_v2(arg, responsehandle);
     } else {
         return platch_respond_not_implemented(responsehandle);
     }

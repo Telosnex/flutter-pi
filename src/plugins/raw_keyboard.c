@@ -675,6 +675,9 @@ int rawkb_send_android_keyevent(
 
     (void) plain_code_point;
 
+    // Flutter's legacy RawKeyEvent parser casts each numeric field to int.
+    // Keep the JSON tokens integral rather than routing them through the
+    // generic double/%g representation.
     // clang-format off
     return platch_send(
         KEY_EVENT_CHANNEL,
@@ -700,17 +703,17 @@ int rawkb_send_android_keyevent(
                 },
                 .values = (struct json_value[14]){
                     /* keymap */ { .type = kJsonString, .string_value = "android" },
-                    /* flags */ { .type = kJsonNumber, .number_value = flags },
-                    /* codePoint */ { .type = kJsonNumber, .number_value = code_point },
-                    /* keyCode */ { .type = kJsonNumber, .number_value = key_code },
-                    /* plainCodePoint */ { .type = kJsonNumber, .number_value = code_point },
-                    /* scanCode */ { .type = kJsonNumber, .number_value = scan_code },
-                    /* metaState */ { .type = kJsonNumber, .number_value = meta_state },
-                    /* source */ { .type = kJsonNumber, .number_value = source },
-                    /* vendorId */ { .type = kJsonNumber, .number_value = vendor_id },
-                    /* productId */ { .type = kJsonNumber, .number_value = product_id },
-                    /* deviceId */ { .type = kJsonNumber, .number_value = device_id },
-                    /* repeatCount */ { .type = kJsonNumber, .number_value = repeat_count },
+                    /* flags */ JSONINT((int64_t) flags),
+                    /* codePoint */ JSONINT((int64_t) code_point),
+                    /* keyCode */ JSONINT((int64_t) key_code),
+                    /* plainCodePoint */ JSONINT((int64_t) code_point),
+                    /* scanCode */ JSONINT((int64_t) scan_code),
+                    /* metaState */ JSONINT((int64_t) meta_state),
+                    /* source */ JSONINT((int64_t) source),
+                    /* vendorId */ JSONINT((int64_t) vendor_id),
+                    /* productId */ JSONINT((int64_t) product_id),
+                    /* deviceId */ JSONINT((int64_t) device_id),
+                    /* repeatCount */ JSONINT((int64_t) repeat_count),
                     /* type */ { .type = kJsonString, .string_value = is_down ? "keydown" : "keyup" },
                     /* character */ { .type = character ? kJsonString : kJsonNull, .string_value = character },
                 },
@@ -734,6 +737,9 @@ int rawkb_send_gtk_keyevent(uint32_t unicode_scalar_values, uint32_t key_code, u
      * type: is_down? "keydown" : "keyup"
      */
 
+    // Do not send kJsonNumber here: its double/%g serialization can turn an
+    // XKB keysym such as XF86AudioMute (0x1008ff12) into scientific notation.
+    // Dart decodes that form as double and RawKeyEvent.fromMessage rejects it.
     // clang-format off
     return platch_send(
         KEY_EVENT_CHANNEL,
@@ -746,10 +752,10 @@ int rawkb_send_gtk_keyevent(uint32_t unicode_scalar_values, uint32_t key_code, u
                 .values = (struct json_value[7]){
                     /* keymap */ { .type = kJsonString, .string_value = "linux" },
                     /* toolkit */ { .type = kJsonString, .string_value = "gtk" },
-                    /* unicodeScalarValues */ { .type = kJsonNumber, .number_value = unicode_scalar_values },
-                    /* keyCode */ { .type = kJsonNumber, .number_value = key_code },
-                    /* scanCode */ { .type = kJsonNumber, .number_value = scan_code },
-                    /* modifiers */ { .type = kJsonNumber, .number_value = modifiers },
+                    /* unicodeScalarValues */ JSONINT((int64_t) unicode_scalar_values),
+                    /* keyCode */ JSONINT((int64_t) key_code),
+                    /* scanCode */ JSONINT((int64_t) scan_code),
+                    /* modifiers */ JSONINT((int64_t) modifiers),
                     /* type */ { .type = kJsonString, .string_value = is_down ? "keydown" : "keyup", },
                 },
             },

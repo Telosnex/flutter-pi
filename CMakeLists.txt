@@ -315,15 +315,17 @@ if (BUILD_GSTREAMER_VIDEO_PLAYER_PLUGIN)
       pkg_check_modules(LIBGSTREAMER_APP IMPORTED_TARGET gstreamer-app-1.0)
       pkg_check_modules(LIBGSTREAMER_ALLOCATORS IMPORTED_TARGET gstreamer-allocators-1.0)
       pkg_check_modules(LIBGSTREAMER_VIDEO IMPORTED_TARGET gstreamer-video-1.0)
+      pkg_check_modules(WPEWEBKIT IMPORTED_TARGET wpe-webkit-2.0)
     else()
       pkg_check_modules(LIBGSTREAMER REQUIRED IMPORTED_TARGET gstreamer-1.0)
       pkg_check_modules(LIBGSTREAMER_PLUGINS_BASE REQUIRED IMPORTED_TARGET gstreamer-plugins-base-1.0)
       pkg_check_modules(LIBGSTREAMER_APP REQUIRED IMPORTED_TARGET gstreamer-app-1.0)
       pkg_check_modules(LIBGSTREAMER_ALLOCATORS REQUIRED IMPORTED_TARGET gstreamer-allocators-1.0)
       pkg_check_modules(LIBGSTREAMER_VIDEO REQUIRED IMPORTED_TARGET gstreamer-video-1.0)
+      pkg_check_modules(WPEWEBKIT REQUIRED IMPORTED_TARGET wpe-webkit-2.0)
     endif()
 
-    if (LIBGSTREAMER_FOUND AND LIBGSTREAMER_PLUGINS_BASE_FOUND AND LIBGSTREAMER_APP_FOUND AND LIBGSTREAMER_ALLOCATORS_FOUND AND LIBGSTREAMER_VIDEO_FOUND)
+    if (LIBGSTREAMER_FOUND AND LIBGSTREAMER_PLUGINS_BASE_FOUND AND LIBGSTREAMER_APP_FOUND AND LIBGSTREAMER_ALLOCATORS_FOUND AND LIBGSTREAMER_VIDEO_FOUND AND WPEWEBKIT_FOUND)
       # There's no other way to query the libinput version (in code) somehow.
       # So we need to roll our own libinput version macro
       string(REPLACE "." ";" LIBGSTREAMER_VERSION_AS_LIST ${LIBGSTREAMER_VERSION})
@@ -342,6 +344,7 @@ if (BUILD_GSTREAMER_VIDEO_PLAYER_PLUGIN)
         PkgConfig::LIBGSTREAMER_APP
         PkgConfig::LIBGSTREAMER_ALLOCATORS
         PkgConfig::LIBGSTREAMER_VIDEO
+        PkgConfig::WPEWEBKIT
       )
     else()
       message(NOTICE "Couldn't find gstreamer libraries. Gstreamer video player plugin won't be build.")

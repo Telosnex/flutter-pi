@@ -62,6 +62,21 @@ struct video_info;
 struct gstplayer;
 struct flutterpi;
 
+enum gstplayer_web_event_type {
+    kGstplayerWebLoadStart,
+    kGstplayerWebLoadStop,
+    kGstplayerWebLoadError,
+    kGstplayerWebHandlerCall,
+    kGstplayerWebJavaScriptMessage,
+};
+
+struct gstplayer_web_event {
+    enum gstplayer_web_event_type type;
+    uint32_t call_id;
+    char *url;
+    char *message;
+};
+
 /// Create a gstreamer video player that loads the video from a flutter asset.
 ///     @arg asset_path     The path of the asset inside the asset bundle.
 ///     @arg package_name   The name of the package containing the asset
@@ -163,6 +178,24 @@ int gstplayer_set_playback_speed(struct gstplayer *player, double playback_speed
 int gstplayer_step_forward(struct gstplayer *player);
 
 int gstplayer_step_backward(struct gstplayer *player);
+
+/// Sends a GStreamer navigation event upstream to a source such as wpesrc.
+/// The event is consumed by this call regardless of success.
+int gstplayer_send_navigation_event(struct gstplayer *player, GstEvent *event);
+
+/// Runtime controls for a `wpevideosrc name=websrc` custom pipeline.
+int gstplayer_web_load_url(struct gstplayer *player, const char *url);
+int gstplayer_web_load_bytes(struct gstplayer *player, const uint8_t *data, size_t size);
+int gstplayer_web_run_javascript(struct gstplayer *player, const char *source);
+int gstplayer_web_respond_to_handler(
+    struct gstplayer *player,
+    uint32_t call_id,
+    const char *result_json,
+    const char *error
+);
+
+/// WebKit lifecycle, JavaScript-message, and handler events.
+struct notifier *gstplayer_get_web_event_notifier(struct gstplayer *player);
 
 /// @brief Get the value notifier for the video info.
 ///

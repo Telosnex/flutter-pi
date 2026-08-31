@@ -239,6 +239,8 @@ struct flutterpi {
     /// main event loop
     pthread_t event_loop_thread;
     pthread_mutex_t event_loop_mutex;
+    pthread_mutex_t platform_task_queue_mutex;
+    struct list_head platform_task_queue;
     sd_event *event_loop;
     int wakeup_event_loop_fd;
 
@@ -608,54 +610,59 @@ static int on_execute_platform_task(sd_event_source *s, void *userdata) {
     return 0;
 }
 
+struct queued_platform_task {
+    struct list_head entry;
+    struct platform_task task;
+};
+
 int flutterpi_post_platform_task(int (*callback)(void *userdata), void *userdata) {
+    struct queued_platform_task *queued;
     struct platform_task *task;
     sd_event_source *src;
+    uint64_t wakeup = 1;
     int ok;
 
-    task = malloc(sizeof *task);
-    if (task == NULL) {
-        return ENOMEM;
+    // sd-event is not thread-safe, and the platform thread holds
+    // event_loop_mutex for the full duration of every callback dispatch. Never
+    // wait for that mutex here: an internal thread may be posting the result of
+    // a synchronous operation currently running on the platform thread.
+    if (pthread_self() != flutterpi->event_loop_thread) {
+        queued = malloc(sizeof *queued);
+        if (queued == NULL) return ENOMEM;
+        list_inithead(&queued->entry);
+        queued->task.callback = callback;
+        queued->task.userdata = userdata;
+
+        pthread_mutex_lock(&flutterpi->platform_task_queue_mutex);
+        list_addtail(&queued->entry, &flutterpi->platform_task_queue);
+        ok = write(flutterpi->wakeup_event_loop_fd, &wakeup, sizeof(wakeup));
+        if (ok < 0) {
+            ok = errno;
+            list_del(&queued->entry);
+            pthread_mutex_unlock(&flutterpi->platform_task_queue_mutex);
+            free(queued);
+            LOG_ERROR("Error arming main loop for platform task. write: %s\n", strerror(ok));
+            return ok;
+        }
+        pthread_mutex_unlock(&flutterpi->platform_task_queue_mutex);
+        return 0;
     }
 
+    task = malloc(sizeof *task);
+    if (task == NULL) return ENOMEM;
     task->callback = callback;
     task->userdata = userdata;
-
-    if (pthread_self() != flutterpi->event_loop_thread) {
-        pthread_mutex_lock(&flutterpi->event_loop_mutex);
-    }
 
     ok = sd_event_add_defer(flutterpi->event_loop, &src, on_execute_platform_task, task);
     if (ok < 0) {
         LOG_ERROR("Error posting platform task to main loop. sd_event_add_defer: %s\n", strerror(-ok));
-        ok = -ok;
-        goto fail_unlock_event_loop;
+        free(task);
+        return -ok;
     }
 
     // Higher values mean lower priority. So later platform tasks are handled later too.
     sd_event_source_set_priority(src, atomic_fetch_add(&platform_task_counter, 1));
-
-    if (pthread_self() != flutterpi->event_loop_thread) {
-        ok = write(flutterpi->wakeup_event_loop_fd, (uint8_t[8]){ 0, 0, 0, 0, 0, 0, 0, 1 }, 8);
-        if (ok < 0) {
-            ok = errno;
-            LOG_ERROR("Error arming main loop for platform task. write: %s\n", strerror(ok));
-            goto fail_unlock_event_loop;
-        }
-    }
-
-    if (pthread_self() != flutterpi->event_loop_thread) {
-        pthread_mutex_unlock(&flutterpi->event_loop_mutex);
-    }
-
     return 0;
-
-fail_unlock_event_loop:
-    if (pthread_self() != flutterpi->event_loop_thread) {
-        pthread_mutex_unlock(&flutterpi->event_loop_mutex);
-    }
-
-    return ok;
 }
 
 /// timed platform tasks
@@ -1062,17 +1069,41 @@ static bool runs_platform_tasks_on_current_thread(void *userdata) {
 }
 
 static int on_wakeup_main_loop(sd_event_source *s, int fd, uint32_t revents, void *userdata) {
-    uint8_t buffer[8];
+    struct queued_platform_task *queued;
+    struct flutterpi *flutterpi = userdata;
+    uint64_t wakeups;
     int ok;
 
     (void) s;
     (void) revents;
-    (void) userdata;
 
-    ok = read(fd, buffer, 8);
+    ok = read(fd, &wakeups, sizeof(wakeups));
     if (ok < 0) {
         perror("[flutter-pi] Could not read mainloop wakeup userdata. read");
         return errno;
+    }
+
+    // Pull one task at a time so producers are never blocked while callbacks
+    // execute. Tasks are FIFO and always run on the platform thread.
+    for (;;) {
+        pthread_mutex_lock(&flutterpi->platform_task_queue_mutex);
+        if (list_is_empty(&flutterpi->platform_task_queue)) {
+            pthread_mutex_unlock(&flutterpi->platform_task_queue_mutex);
+            break;
+        }
+        queued = list_first_entry(
+            &flutterpi->platform_task_queue,
+            struct queued_platform_task,
+            entry
+        );
+        list_del(&queued->entry);
+        pthread_mutex_unlock(&flutterpi->platform_task_queue_mutex);
+
+        ok = queued->task.callback(queued->task.userdata);
+        if (ok != 0) {
+            LOG_ERROR("Error executing queued platform task: %s\n", strerror(ok));
+        }
+        free(queued);
     }
 
     return 0;
@@ -2398,7 +2429,7 @@ struct flutterpi *flutterpi_new_from_args(int argc, char **argv) {
         goto fail_close_wakeup_fd;
     }
 
-    ok = sd_event_add_io(event_loop, NULL, wakeup_fd, EPOLLIN, on_wakeup_main_loop, NULL);
+    ok = sd_event_add_io(event_loop, NULL, wakeup_fd, EPOLLIN, on_wakeup_main_loop, fpi);
     if (ok < 0) {
         LOG_ERROR("Error adding wakeup callback to main loop. sd_event_add_io: %s\n", strerror(-ok));
         goto fail_unref_event_loop;
@@ -2718,6 +2749,8 @@ struct flutterpi *flutterpi_new_from_args(int argc, char **argv) {
     window_unref(window);
 
     pthread_mutex_init(&fpi->event_loop_mutex, get_default_mutex_attrs());
+    pthread_mutex_init(&fpi->platform_task_queue_mutex, get_default_mutex_attrs());
+    list_inithead(&fpi->platform_task_queue);
     fpi->event_loop_thread = pthread_self();
     fpi->wakeup_event_loop_fd = wakeup_fd;
     fpi->event_loop = event_loop;
@@ -2818,6 +2851,13 @@ void flutterpi_destroy(struct flutterpi *flutterpi) {
     LOG_DEBUG("deinit\n");
 
     pthread_mutex_destroy(&flutterpi->event_loop_mutex);
+    pthread_mutex_lock(&flutterpi->platform_task_queue_mutex);
+    list_for_each_entry_safe(struct queued_platform_task, queued, &flutterpi->platform_task_queue, entry) {
+        list_del(&queued->entry);
+        free(queued);
+    }
+    pthread_mutex_unlock(&flutterpi->platform_task_queue_mutex);
+    pthread_mutex_destroy(&flutterpi->platform_task_queue_mutex);
     texture_registry_destroy(flutterpi->texture_registry);
     plugin_registry_destroy(flutterpi->plugin_registry);
     unload_flutter_engine_lib(flutterpi->flutter.engine_handle);
