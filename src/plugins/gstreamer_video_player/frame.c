@@ -20,6 +20,102 @@
 #include "util/logging.h"
 #include "util/refcounting.h"
 
+#include "dmabuf_surface.h"
+
+/// Copy a non-dmabuf gstreamer frame into a *scanout-capable* GBM BO.
+///
+/// The square R8 BO used by the texture path is a flat byte array reinterpreted
+/// downstream as a texture; it has no real geometry, so a DRM plane cannot scan
+/// it out. An overlay plane needs true width/height/stride and a real fourcc,
+/// which is what this produces. Same single copy as the texture path - what is
+/// saved is the EGLImage import, the GL sample and the Flutter composite, and
+/// it works under Vulkan, which is the point.
+///
+/// Returns 0 and fills @dmabuf_out (which owns fds[0]) on success, else errno.
+UNUSED static int dup_gst_frame_as_scanout_dmabuf(
+    struct gbm_device *gbm_device,
+    GstBuffer *buffer,
+    uint32_t width,
+    uint32_t height,
+    enum pixfmt format,
+    uint32_t gbm_format,
+    struct dmabuf *dmabuf_out
+) {
+    GstMapInfo map_info;
+    struct gbm_bo *bo;
+    uint32_t dst_stride, src_stride, row_bytes;
+    void *map, *map_data;
+    int fd, ok;
+
+    if (gst_buffer_map(buffer, &map_info, GST_MAP_READ) == FALSE) {
+        LOG_ERROR("Could not map gstreamer buffer to copy it into a scanout buffer.\n");
+        return EIO;
+    }
+
+    if (height == 0 || map_info.size < (size_t) height) {
+        LOG_ERROR("Frame buffer too small for %u rows.\n", (unsigned) height);
+        ok = EINVAL;
+        goto fail_unmap_buffer;
+    }
+
+    bo = gbm_bo_create(gbm_device, width, height, gbm_format, GBM_BO_USE_SCANOUT | GBM_BO_USE_LINEAR);
+    if (bo == NULL) {
+        LOG_ERROR("Could not create scanout-capable GBM BO (%ux%u).\n", (unsigned) width, (unsigned) height);
+        ok = ENOMEM;
+        goto fail_unmap_buffer;
+    }
+
+    map_data = NULL;
+    dst_stride = 0;
+    map = gbm_bo_map(bo, 0, 0, width, height, GBM_BO_TRANSFER_WRITE, &dst_stride, &map_data);
+    if (map == NULL) {
+        LOG_ERROR("Could not mmap scanout GBM BO.\n");
+        ok = EIO;
+        goto fail_destroy_bo;
+    }
+
+    // Unlike the texture path, destination padding is fine here: a scanout BO
+    // carries its own stride, so copy row by row rather than demanding that the
+    // strides match exactly.
+    src_stride = (uint32_t) (map_info.size / height);
+    row_bytes = src_stride < dst_stride ? src_stride : dst_stride;
+
+    for (uint32_t y = 0; y < height; y++) {
+        memcpy((uint8_t *) map + (size_t) y * dst_stride, map_info.data + (size_t) y * src_stride, row_bytes);
+    }
+
+    gbm_bo_unmap(bo, map_data);
+
+    fd = gbm_bo_get_fd(bo);
+    if (fd < 0) {
+        LOG_ERROR("Could not export scanout GBM BO as a dmabuf.\n");
+        ok = EIO;
+        goto fail_destroy_bo;
+    }
+
+    memset(dmabuf_out, 0, sizeof *dmabuf_out);
+    dmabuf_out->format = format;
+    dmabuf_out->width = (int) width;
+    dmabuf_out->height = (int) height;
+    dmabuf_out->fds[0] = fd;
+    dmabuf_out->fds[1] = dmabuf_out->fds[2] = dmabuf_out->fds[3] = -1;
+    dmabuf_out->offsets[0] = 0;
+    dmabuf_out->strides[0] = (int) dst_stride;
+    dmabuf_out->has_modifiers = false;
+
+    gbm_bo_destroy(bo);
+    gst_buffer_unmap(buffer, &map_info);
+    return 0;
+
+fail_destroy_bo:
+    gbm_bo_destroy(bo);
+
+fail_unmap_buffer:
+    gst_buffer_unmap(buffer, &map_info);
+    return ok;
+}
+
+
 #define MAX_N_PLANES 4
 
 #define GSTREAMER_VER(major, minor, patch) ((((major) &0xFF) << 16) | (((minor) &0xFF) << 8) | ((patch) &0xFF))
