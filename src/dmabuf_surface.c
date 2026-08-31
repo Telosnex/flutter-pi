@@ -173,22 +173,19 @@ fail_return_null:
 }
 
 int on_resolve_texture_frame(size_t width, size_t height, void *userdata, struct texture_frame *frame_out) {
-    /// TODO: Implement
+    /// TODO: Implement the texture (cold) path: import the queued dmabuf as an
+    /// EGLImage via EGL_EXT_image_dma_buf_import and hand back a real texture.
+    /// Until then this must fail rather than return a 0x0 texture, which the
+    /// engine would happily composite as garbage.
     (void) width;
     (void) height;
     (void) userdata;
+    (void) frame_out;
 
-#ifdef HAVE_GLES2
-    frame_out->gl.target = GL_TEXTURE_2D;
-    frame_out->gl.name = 0;
-    frame_out->gl.format = GL_RGBA8_OES;
-    frame_out->gl.width = 0;
-    frame_out->gl.height = 0;
-#endif
-
-    frame_out->userdata = NULL;
-    frame_out->destroy = NULL;
-    return 0;
+    LOG_ERROR(
+        "dmabuf_surface has no texture path yet; use it as a platform view (hardware overlay) instead.\n"
+    );
+    return EIO;
 }
 
 int dmabuf_surface_push_dmabuf(struct dmabuf_surface *s, const struct dmabuf *buf, dmabuf_release_cb_t release_cb) {
@@ -202,8 +199,6 @@ int dmabuf_surface_push_dmabuf(struct dmabuf_surface *s, const struct dmabuf *bu
 #ifdef HAVE_EGL_GLES2
     assert(eglGetCurrentContext() != EGL_NO_CONTEXT);
 #endif
-
-    UNIMPLEMENTED();
 
     b = malloc(sizeof *b);
     if (b == NULL) {
