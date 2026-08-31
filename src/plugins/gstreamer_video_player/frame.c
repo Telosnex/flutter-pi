@@ -191,6 +191,14 @@ struct frame_interface *frame_interface_new(struct gl_renderer *renderer) {
     bool supports_extended_imports, supports_external_target;
     int n_formats;
 
+    if (renderer == NULL) {
+        LOG_ERROR(
+            "Video playback requires the OpenGL renderer. The GStreamer video player imports "
+            "frames as EGLImages, which the Vulkan renderer does not provide.\n"
+        );
+        return NULL;
+    }
+
     interface = malloc(sizeof *interface);
     if (interface == NULL) {
         return NULL;
