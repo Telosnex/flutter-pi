@@ -12,6 +12,7 @@
 
 #include <errno.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include <pthread.h>
 
@@ -992,6 +993,10 @@ MUST_CHECK struct window *kms_window_new(
         has_forced_pixel_format ? get_pixfmt_info(forced_pixel_format)->name : "(any)"
     );
 
+    // Tell the frame scheduler the actual refresh interval of the selected
+    // mode, so flutter vsync replies use accurate timestamps.
+    frame_scheduler_set_frame_interval(scheduler, (uint64_t) (1000000000.0 / mode_get_vrefresh(selected_mode)));
+
     window->kms.drmdev = drmdev_ref(drmdev);
     window->kms.connector = selected_connector;
     window->kms.encoder = selected_encoder;
@@ -1083,38 +1088,68 @@ void kms_window_deinit(struct window *window) {
 
 struct frame {
     struct tracer *tracer;
+    struct frame_scheduler *scheduler;
     struct kms_req *req;
     bool unset_should_apply_mode_on_commit;
 };
 
-UNUSED static void on_scanout(struct drmdev *drmdev, uint64_t vblank_ns, void *userdata) {
-    ASSERT_NOT_NULL(drmdev);
-    (void) drmdev;
-    (void) vblank_ns;
-    (void) userdata;
+static void frame_destroy(struct frame *frame) {
+    tracer_unref(frame->tracer);
+    frame_scheduler_unref(frame->scheduler);
+    kms_req_unref(frame->req);
+    free(frame);
+}
 
-    /// TODO: What should we do here?
+static void on_scanout(struct drmdev *drmdev, uint64_t vblank_ns, void *userdata) {
+    struct frame *frame;
+
+    ASSERT_NOT_NULL(drmdev);
+    ASSERT_NOT_NULL(userdata);
+    (void) drmdev;
+
+    frame = userdata;
+
+    TRACER_INSTANT(frame->tracer, "kms page flip");
+
+    // This potentially presents the next queued frame and replies to a
+    // pending flutter vsync request.
+    frame_scheduler_on_scanout(frame->scheduler, vblank_ns != 0, vblank_ns);
+
+    frame_destroy(frame);
 }
 
 static void on_present_frame(void *userdata) {
     struct frame *frame;
+    struct frame_scheduler *scheduler;
+    struct tracer *tracer;
     int ok;
 
     ASSERT_NOT_NULL(userdata);
 
     frame = userdata;
 
-    TRACER_BEGIN(frame->tracer, "kms_req_commit_nonblocking");
-    ok = kms_req_commit_blocking(frame->req, NULL);
-    TRACER_END(frame->tracer, "kms_req_commit_nonblocking");
+    // The page-flip event might be handled on another thread (the main event
+    // loop) as soon as the commit is submitted, so `frame` may already be
+    // destroyed by on_scanout once kms_req_commit_nonblocking returns.
+    // Keep our own references for the failure path & tracing.
+    tracer = tracer_ref(frame->tracer);
+    scheduler = frame_scheduler_ref(frame->scheduler);
+
+    TRACER_BEGIN(tracer, "kms_req_commit_nonblocking");
+    ok = kms_req_commit_nonblocking(frame->req, on_scanout, frame, NULL);
+    TRACER_END(tracer, "kms_req_commit_nonblocking");
 
     if (ok != 0) {
-        LOG_ERROR("Could not commit frame request.\n");
+        LOG_ERROR("Could not commit frame request. kms_req_commit_nonblocking: %s\n", strerror(ok));
+        frame_destroy(frame);
+
+        // Tell the scheduler no page flip will arrive for this frame, so it
+        // can reset the presentation pipeline.
+        frame_scheduler_on_present_failed(scheduler);
     }
 
-    tracer_unref(frame->tracer);
-    kms_req_unref(frame->req);
-    free(frame);
+    frame_scheduler_unref(scheduler);
+    tracer_unref(tracer);
 }
 
 static void on_cancel_frame(void *userdata) {
@@ -1123,9 +1158,7 @@ static void on_cancel_frame(void *userdata) {
 
     frame = userdata;
 
-    tracer_unref(frame->tracer);
-    kms_req_unref(frame->req);
-    free(frame);
+    frame_destroy(frame);
 }
 
 static int kms_window_push_composition_locked(struct window *window, struct fl_layer_composition *composition) {
@@ -1136,21 +1169,6 @@ static int kms_window_push_composition_locked(struct window *window, struct fl_l
 
     ASSERT_NOT_NULL(window);
     ASSERT_NOT_NULL(composition);
-
-    // If flutter won't request frames (because the vsync callback is broken),
-    // we'll wait here for the previous frame to be presented / rendered.
-    // Otherwise the surface_swap_buffers at the bottom might allocate an
-    // additional buffer and we'll potentially use more buffers than we're
-    // trying to use.
-    // if (!window->use_frame_requests) {
-    //     TRACER_BEGIN(window->tracer, "window_request_frame_and_wait_for_begin");
-    //     ok = window_request_frame_and_wait_for_begin(window);
-    //     TRACER_END(window->tracer, "window_request_frame_and_wait_for_begin");
-    //     if (ok != 0) {
-    //         LOG_ERROR("Could not wait for frame begin.\n");
-    //         return ok;
-    //     }
-    // }
 
     /// TODO: If we don't have new revisions, we don't need to scanout anything.
     fl_layer_composition_swap_ptrs(&window->composition, composition);
@@ -1243,61 +1261,14 @@ static int kms_window_push_composition_locked(struct window *window, struct fl_l
 
     frame->req = req;
     frame->tracer = tracer_ref(window->tracer);
+    frame->scheduler = frame_scheduler_ref(window->frame_scheduler);
     frame->unset_should_apply_mode_on_commit = window->kms.should_apply_mode;
 
     frame_scheduler_present_frame(window->frame_scheduler, on_present_frame, frame, on_cancel_frame);
 
-    // if (window->present_mode == kDoubleBufferedVsync_PresentMode) {
-    //     TRACER_BEGIN(window->tracer, "kms_req_builder_commit");
-    //     ok = kms_req_commit(req, /* blocking: */ false);
-    //     TRACER_END(window->tracer, "kms_req_builder_commit");
-    //
-    //     if (ok != 0) {
-    //         LOG_ERROR("Could not commit frame request.\n");
-    //         goto fail_unref_window2;
-    //     }
-    //
-    //     if (window->set_set_mode) {
-    //         window->set_mode = false;
-    //         window->set_set_mode = false;
-    //     }
-    // } else {
-    //     ASSERT_EQUALS(window->present_mode, kTripleBufferedVsync_PresentMode);
-    //
-    //     if (window->present_immediately) {
-    //         TRACER_BEGIN(window->tracer, "kms_req_builder_commit");
-    //         ok = kms_req_commit(req, /* blocking: */ false);
-    //         TRACER_END(window->tracer, "kms_req_builder_commit");
-    //
-    //         if (ok != 0) {
-    //             LOG_ERROR("Could not commit frame request.\n");
-    //             goto fail_unref_window2;
-    //         }
-    //
-    //         if (window->set_set_mode) {
-    //             window->set_mode = false;
-    //             window->set_set_mode = false;
-    //         }
-    //
-    //         window->present_immediately = false;
-    //     } else {
-    //         if (window->next_frame != NULL) {
-    //             /// FIXME: Call the release callbacks when the kms_req is destroyed, not when it's unrefed.
-    //             /// Not sure this here will lead to the release callbacks being called multiple times.
-    //             kms_req_call_release_callbacks(window->next_frame);
-    //             kms_req_unref(window->next_frame);
-    //         }
-    //
-    //         window->next_frame = kms_req_ref(req);
-    //         window->set_set_mode = window->set_mode;
-    //     }
-    // }
-
-    // KMS Req is committed now and drmdev keeps a ref
-    // on it internally, so we don't need to keep this one.
-    // kms_req_unref(req);
-
-    // window_on_rendering_complete(window);
+    // The scheduler has now either committed the frame, or has queued it to be
+    // committed once the current in-flight frame has been scanned out. It keeps
+    // track of the frame resources via the present/cancel callbacks.
 
     return 0;
 
@@ -1658,6 +1629,10 @@ MUST_CHECK struct window *dummy_window_new(
         false, PIXFMT_RGB565
         // clang-format on
     );
+
+    if (refresh_rate > 0.0) {
+        frame_scheduler_set_frame_interval(scheduler, (uint64_t) (1000000000.0 / refresh_rate));
+    }
 
     window->renderer_type = renderer_type;
     if (gl_renderer != NULL) {
