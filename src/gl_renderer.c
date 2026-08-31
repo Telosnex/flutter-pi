@@ -289,8 +289,14 @@ struct gl_renderer *gl_renderer_new_from_gbm_device(
         forced_egl_config = EGL_NO_CONFIG_KHR;
     } else {
         // choose a config
+        // Impeller renders onscreen into FBO 0 and cannot attach its own
+        // depth/stencil there, so the EGL config must supply them. Without a
+        // stencil buffer, stencil-then-cover path fills silently no-op and the
+        // cover pass fills the whole coverage rect (concave/even-odd paths and
+        // any text over em 250 come out as solid blocks).
         const EGLint config_attribs[] = {
-            EGL_SURFACE_TYPE, EGL_WINDOW_BIT, EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT, EGL_SAMPLES, 0, EGL_NONE,
+            EGL_SURFACE_TYPE, EGL_WINDOW_BIT, EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT, EGL_SAMPLES, 0,
+            EGL_DEPTH_SIZE,   24,             EGL_STENCIL_SIZE,    8,                  EGL_NONE,
         };
 
         if (has_forced_pixel_format == false) {
@@ -662,7 +668,10 @@ gl_renderer_choose_config(struct gl_renderer *renderer, bool has_desired_pixel_f
         return renderer->forced_egl_config;
     }
 
-    const EGLint config_attribs[] = { EGL_SURFACE_TYPE, EGL_WINDOW_BIT, EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT, EGL_SAMPLES, 0, EGL_NONE };
+    // See note above: Impeller needs depth+stencil on the onscreen config.
+    const EGLint config_attribs[] = { EGL_SURFACE_TYPE, EGL_WINDOW_BIT,   EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+                                      EGL_SAMPLES,      0,                EGL_DEPTH_SIZE,      24,
+                                      EGL_STENCIL_SIZE, 8,                EGL_NONE };
 
     return choose_config_with_pixel_format(
         renderer->egl_display,
@@ -677,8 +686,10 @@ ATTR_PURE EGLConfig gl_renderer_choose_config_direct(struct gl_renderer *rendere
     ASSERT_NOT_NULL(renderer);
     ASSUME_PIXFMT_VALID(pixel_format);
 
+    // See note above: Impeller needs depth+stencil on the onscreen config.
     const EGLint config_attribs[] = {
-        EGL_SURFACE_TYPE, EGL_WINDOW_BIT, EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT, EGL_SAMPLES, 0, EGL_NONE,
+        EGL_SURFACE_TYPE, EGL_WINDOW_BIT, EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT, EGL_SAMPLES, 0,
+        EGL_DEPTH_SIZE,   24,             EGL_STENCIL_SIZE,    8,                  EGL_NONE,
     };
 
     return choose_config_with_pixel_format(renderer->egl_display, config_attribs, pixel_format);
