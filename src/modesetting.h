@@ -822,25 +822,24 @@ bool kms_req_builder_prefer_next_layer_opaque(struct kms_req_builder *builder);
  * If this is the first layer, the framebuffer should cover the entire screen
  * (CRTC).
  *
- * To allow the use of explicit fencing, specify an in_fence_fd in @param layer
- * and a @param deferred_release_callback.
+ * To allow the use of explicit fencing, specify an in_fence_fd in @param layer.
  *
- * If explicit fencing is supported:
- *   - the in_fence_fd should be a DRM syncobj fd that signals
- *     when the GPU has finished rendering to the framebuffer and is ready
- *     to be scanned out.
- *   - @param deferred_release_callback will be called
- *     with a DRM syncobj fd that is signaled once the framebuffer is no longer
- *     being displayed on screen (and can be rendered into again)
+ * The in_fence_fd must be a sync-file file descriptor (e.g. exported from an
+ * EGL native fence sync or a Vulkan SYNC_FD semaphore/fence) that signals when
+ * the GPU has finished rendering to the framebuffer and it is ready to be
+ * scanned out.
  *
- * If explicit fencing is not supported:
- *   - the in_fence_fd in @param layer will be closed by this procedure.
- *   - @param deferred_release_callback will NOT be called and
- *     @param release_callback will be called instead.
+ * Ownership: On success, the request takes ownership of the in_fence_fd,
+ * regardless of whether explicit fencing is actually supported by the plane.
+ * With atomic modesetting, the fd is attached to the plane's IN_FENCE_FD
+ * property (if the plane has one; the kernel dup()s it at commit time) and
+ * closed when the request is destroyed. With legacy modesetting, explicit
+ * fencing is not supported and the fd is closed immediately; the driver's
+ * implicit synchronization is used instead.
  *
- * Explicit fencing is supported: When atomic modesetting is being used and
- * the driver supports it. (Driver has IN_FENCE_FD plane and OUT_FENCE_PTR crtc
- * properties)
+ * @param deferred_release_callback is intended to provide an out-fence
+ * (OUT_FENCE_PTR) based release signal in the future; it's unimplemented right
+ * now and must be NULL.
  *
  * @param builder          The KMS request builder.
  * @param layer            The exact details (src pos, output pos, rotation,

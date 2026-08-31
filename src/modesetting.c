@@ -2439,6 +2439,16 @@ static void kms_req_builder_destroy(struct kms_req_builder *builder) {
         if (builder->layers[i].release_callback != NULL) {
             builder->layers[i].release_callback(builder->layers[i].release_callback_userdata);
         }
+
+        // For atomic modesetting, we own the in-fence fd of every successfully
+        // pushed layer. (The kernel dup()s it internally at commit time.)
+        // The legacy path already closed it in kms_req_builder_push_fb_layer.
+        if (!builder->use_legacy && builder->layers[i].layer.has_in_fence_fd) {
+            assert(builder->layers[i].layer.in_fence_fd >= 0);
+            close(builder->layers[i].layer.in_fence_fd);
+            builder->layers[i].layer.has_in_fence_fd = false;
+            builder->layers[i].layer.in_fence_fd = -1;
+        }
     }
     if (builder->req != NULL) {
         drmModeAtomicFree(builder->req);
@@ -2785,6 +2795,24 @@ int kms_req_builder_push_fb_layer(
 
             if (plane->has_blend_mode && plane->supported_blend_modes[kNone_DrmBlendMode]) {
                 drmModeAtomicAddProperty(builder->req, plane_id, plane->ids.pixel_blend_mode, kNone_DrmBlendMode);
+            }
+        }
+
+        if (layer->has_in_fence_fd) {
+            if (plane->ids.in_fence_fd != DRM_ID_NONE) {
+                // The kernel dup()s the sync-file fd internally when the atomic
+                // commit ioctl is executed. We retain ownership of layer->in_fence_fd;
+                // it's closed in kms_req_builder_destroy.
+                drmModeAtomicAddProperty(builder->req, plane_id, plane->ids.in_fence_fd, layer->in_fence_fd);
+            } else {
+                // The buffer might still be implicitly synchronized (the driver
+                // waits for the attached dma-resv fences before scanning it out),
+                // but we can't express the explicit fence. Warn once per plane
+                // would be nicer, but this is a cold path anyway.
+                LOG_DEBUG(
+                    "Layer has an explicit render-completion fence, but the DRM plane doesn't support the IN_FENCE_FD property. "
+                    "Falling back to implicit synchronization.\n"
+                );
             }
         }
     }
