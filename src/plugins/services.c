@@ -14,6 +14,8 @@ struct plugin {
     char label[256];
     uint32_t primary_color;  // ARGB8888 (blue is the lowest byte)
     char isolate_id[32];
+    char *clipboard_text;
+    bool clipboard_has_string;
 };
 
 static void on_receive_navigation(ASSERTED void *userdata, const FlutterPlatformMessage *message) {
@@ -55,17 +57,65 @@ static void on_receive_platform(void *userdata, const FlutterPlatformMessage *me
 
     if (streq(object.method, "Clipboard.setData")) {
         /*
-         *  Clipboard.setData(Map data)
-         *      Places the data from the text entry of the argument,
-         *      which must be a Map, onto the system clipboard.
+         * flutter-pi has no desktop clipboard broker. Keep a process-local
+         * text clipboard so Flutter text controls can still copy and paste
+         * within the foreground application.
          */
+        if (arg->type != kJsonObject) {
+            platch_free_obj(&object);
+            platch_respond_illegal_arg_json(message->response_handle, "Expected Clipboard.setData argument to be a map.");
+            return;
+        }
+        value = jsobject_get(arg, "text");
+        if (value == NULL || value->type != kJsonString) {
+            platch_free_obj(&object);
+            platch_respond_illegal_arg_json(message->response_handle, "Expected Clipboard.setData text to be a string.");
+            return;
+        }
+
+        char *text = strdup(value->string_value);
+        if (text == NULL) {
+            platch_free_obj(&object);
+            platch_respond_error_json(message->response_handle, "out-of-memory", "Could not store clipboard text.", NULL);
+            return;
+        }
+        free(plugin->clipboard_text);
+        plugin->clipboard_text = text;
+        plugin->clipboard_has_string = true;
+
+        platch_free_obj(&object);
+        platch_respond_success_json(message->response_handle, NULL);
+        return;
     } else if (streq(object.method, "Clipboard.getData")) {
-        /*
-         *  Clipboard.getData(String format)
-         *      Returns the data that has the format specified in the argument
-         *      from the system clipboard. The only currently supported is "text/plain".
-         *      The result is a Map with a single key, "text".
-         */
+        struct json_value result;
+
+        if (arg->type != kJsonString) {
+            platch_free_obj(&object);
+            platch_respond_illegal_arg_json(message->response_handle, "Expected Clipboard.getData format to be a string.");
+            return;
+        }
+        if (!streq(arg->string_value, "text/plain") || !plugin->clipboard_has_string) {
+            platch_free_obj(&object);
+            platch_respond_success_json(message->response_handle, NULL);
+            return;
+        }
+
+        result = JSONOBJECT1("text", JSONSTRING(plugin->clipboard_text));
+        platch_free_obj(&object);
+        platch_respond_success_json(message->response_handle, &result);
+        return;
+    } else if (streq(object.method, "Clipboard.hasStrings")) {
+        struct json_value result;
+
+        if (arg->type != kJsonString || !streq(arg->string_value, "text/plain")) {
+            platch_free_obj(&object);
+            platch_respond_illegal_arg_json(message->response_handle, "Expected Clipboard.hasStrings format to be text/plain.");
+            return;
+        }
+        result = JSONOBJECT1("value", JSONBOOL(plugin->clipboard_has_string));
+        platch_free_obj(&object);
+        platch_respond_success_json(message->response_handle, &result);
+        return;
     } else if (streq(object.method, "HapticFeedback.vibrate")) {
         /*
          *  HapticFeedback.vibrate(void)
@@ -396,6 +446,8 @@ enum plugin_init_result services_init(struct flutterpi *flutterpi, void **userda
     }
 
     plugin->flutterpi = flutterpi;
+    plugin->clipboard_text = NULL;
+    plugin->clipboard_has_string = false;
 
     ok = plugin_registry_set_receiver_v2_locked(registry, FLUTTER_NAVIGATION_CHANNEL, on_receive_navigation, plugin);
     if (ok != 0) {
@@ -481,6 +533,7 @@ void services_deinit(struct flutterpi *flutterpi, void *userdata) {
     plugin_registry_remove_receiver_v2_locked(registry, FLUTTER_ACCESSIBILITY_CHANNEL);
     plugin_registry_remove_receiver_v2_locked(registry, FLUTTER_PLATFORM_VIEWS_CHANNEL);
     plugin_registry_remove_receiver_v2_locked(registry, FLUTTER_MOUSECURSOR_CHANNEL);
+    free(plugin->clipboard_text);
     free(plugin);
 }
 
