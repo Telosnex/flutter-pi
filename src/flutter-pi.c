@@ -136,6 +136,11 @@ OPTIONS:\n\
   --videomode widthxheight@hz  Uses an output videomode that satisfies the argument.\n\
                              If no hz value is given, the highest possible refreshrate\n\
                              will be used.\n\
+  --videomode preferred      Uses the exact display-preferred timing.\n\
+  --videomode preferred@max  Uses the preferred resolution at its highest progressive\n\
+                             refresh rate.\n\
+  --videomode preferred@hz   Uses the preferred resolution at its highest progressive\n\
+                             nominal refresh rate at or below hz.\n\
 \n\
   --dummy-display            Simulate a display. Useful for running apps\n\
                              without a display attached.\n\
@@ -154,6 +159,7 @@ EXAMPLES:\n\
   flutter-pi -d \"155, 86\" ./my_app\n\
   flutter-pi --videomode 1920x1080 ./my_app\n\
   flutter-pi --videomode 1280x720@60 ./my_app\n\
+  flutter-pi --videomode preferred@120 ./my_app\n\
 \n\
 SEE ALSO:\n\
   Author:  Hannes Winkler, a.k.a ardera\n\

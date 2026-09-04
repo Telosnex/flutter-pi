@@ -225,6 +225,15 @@ void test_parse_desired_videomode_arg() {
 
     expected.desired_videomode = "1920x1080@60";
     expect_parsed_cmdline_args_matches(4, (char *[]){ "flutter-pi", "--videomode", "1920x1080@60", BUNDLE_PATH }, true, expected);
+
+    expected.desired_videomode = "preferred";
+    expect_parsed_cmdline_args_matches(4, (char *[]){ "flutter-pi", "--videomode", "preferred", BUNDLE_PATH }, true, expected);
+
+    expected.desired_videomode = "preferred@max";
+    expect_parsed_cmdline_args_matches(4, (char *[]){ "flutter-pi", "--videomode", "preferred@max", BUNDLE_PATH }, true, expected);
+
+    expected.desired_videomode = "preferred@120";
+    expect_parsed_cmdline_args_matches(4, (char *[]){ "flutter-pi", "--videomode", "preferred@120", BUNDLE_PATH }, true, expected);
 }
 
 int main() {

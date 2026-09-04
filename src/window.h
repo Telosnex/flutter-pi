@@ -35,6 +35,22 @@ enum renderer_type { kOpenGL_RendererType, kVulkan_RendererType };
 DECLARE_REF_OPS(window)
 
 /**
+ * Selects a video mode from a connector's advertised modes.
+ *
+ * In addition to widthxheight[@hz], desired_videomode accepts:
+ * - preferred: the exact DRM/EDID preferred timing.
+ * - preferred@max: the highest progressive refresh at the preferred timing's
+ *   resolution.
+ * - preferred@hz: the highest progressive nominal refresh at or below hz at the
+ *   preferred timing's resolution.
+ *
+ * If there is no DRM-preferred mode, the largest available mode is used as the
+ * preferred fallback. If the request cannot be satisfied, the preferred
+ * timing is returned and matched_out is set to false.
+ */
+drmModeModeInfo *window_select_videomode(drmModeModeInfo *modes, size_t n_modes, const char *desired_videomode, bool *matched_out);
+
+/**
  * @brief Creates a new KMS window.
  *
  * @param tracer

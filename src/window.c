@@ -725,6 +725,145 @@ static void cursor_buffer_unref_with_locked_drmdev(void *userdata) {
     }
 }
 
+static bool mode_is_progressive(const drmModeModeInfo *mode) {
+    return (mode->flags & DRM_MODE_FLAG_INTERLACE) == 0;
+}
+
+static drmModeModeInfo *select_preferred_or_best_mode(drmModeModeInfo *modes, size_t n_modes) {
+    drmModeModeInfo *mode = NULL;
+
+    for (size_t i = 0; i < n_modes; i++) {
+        drmModeModeInfo *candidate = &modes[i];
+        if (candidate->type & DRM_MODE_TYPE_PREFERRED) {
+            return candidate;
+        }
+        if (mode == NULL) {
+            mode = candidate;
+            continue;
+        }
+
+        uint64_t area = (uint64_t) candidate->hdisplay * candidate->vdisplay;
+        uint64_t old_area = (uint64_t) mode->hdisplay * mode->vdisplay;
+        double refresh = mode_get_vrefresh(candidate);
+        double old_refresh = mode_get_vrefresh(mode);
+        if (area > old_area || (area == old_area && refresh > old_refresh) ||
+            (area == old_area && refresh == old_refresh && mode_is_progressive(candidate) && !mode_is_progressive(mode))) {
+            mode = candidate;
+        }
+    }
+
+    return mode;
+}
+
+static drmModeModeInfo *select_preferred_resolution_refresh(
+    drmModeModeInfo *modes,
+    size_t n_modes,
+    const drmModeModeInfo *preferred,
+    bool has_refresh_cap,
+    double refresh_cap
+) {
+    drmModeModeInfo *mode = NULL;
+    bool has_progressive_candidate = false;
+
+    for (size_t i = 0; i < n_modes; i++) {
+        drmModeModeInfo *candidate = &modes[i];
+        if (candidate->hdisplay != preferred->hdisplay || candidate->vdisplay != preferred->vdisplay ||
+            (has_refresh_cap && candidate->vrefresh > refresh_cap)) {
+            continue;
+        }
+        if (mode_is_progressive(candidate)) {
+            has_progressive_candidate = true;
+        }
+    }
+
+    for (size_t i = 0; i < n_modes; i++) {
+        drmModeModeInfo *candidate = &modes[i];
+        if (candidate->hdisplay != preferred->hdisplay || candidate->vdisplay != preferred->vdisplay ||
+            (has_refresh_cap && candidate->vrefresh > refresh_cap) || (has_progressive_candidate && !mode_is_progressive(candidate))) {
+            continue;
+        }
+        if (mode == NULL || mode_get_vrefresh(candidate) > mode_get_vrefresh(mode)) {
+            mode = candidate;
+        }
+    }
+
+    return mode;
+}
+
+drmModeModeInfo *window_select_videomode(drmModeModeInfo *modes, size_t n_modes, const char *desired_videomode, bool *matched_out) {
+    drmModeModeInfo *preferred = select_preferred_or_best_mode(modes, n_modes);
+    drmModeModeInfo *mode = NULL;
+    bool matched = true;
+
+    if (preferred == NULL) {
+        if (matched_out != NULL) {
+            *matched_out = false;
+        }
+        return NULL;
+    }
+
+    if (desired_videomode == NULL || streq(desired_videomode, "preferred")) {
+        mode = preferred;
+    } else if (strncmp(desired_videomode, "preferred@", strlen("preferred@")) == 0) {
+        const char *refresh = desired_videomode + strlen("preferred@");
+        bool has_refresh_cap = !streq(refresh, "max");
+        double refresh_cap = 0.0;
+
+        if (has_refresh_cap) {
+            char *end = NULL;
+            errno = 0;
+            refresh_cap = strtod(refresh, &end);
+            if (errno != 0 || end == refresh || *end != '\0' || !isfinite(refresh_cap) || refresh_cap <= 0.0) {
+                matched = false;
+                goto fallback;
+            }
+        }
+
+        mode = select_preferred_resolution_refresh(modes, n_modes, preferred, has_refresh_cap, refresh_cap);
+        if (mode == NULL) {
+            matched = false;
+            goto fallback;
+        }
+    } else {
+        for (size_t i = 0; i < n_modes; i++) {
+            drmModeModeInfo *candidate = &modes[i];
+            char modeline[64];
+            char modeline_nohz[64];
+
+            snprintf(
+                modeline,
+                sizeof(modeline),
+                "%" PRIu16 "x%" PRIu16 "@%" PRIu32,
+                candidate->hdisplay,
+                candidate->vdisplay,
+                candidate->vrefresh
+            );
+            snprintf(modeline_nohz, sizeof(modeline_nohz), "%" PRIu16 "x%" PRIu16, candidate->hdisplay, candidate->vdisplay);
+
+            if ((streq(modeline, desired_videomode) || streq(modeline_nohz, desired_videomode)) &&
+                (mode == NULL || mode_get_vrefresh(candidate) > mode_get_vrefresh(mode))) {
+                mode = candidate;
+            }
+        }
+
+        if (mode == NULL) {
+            matched = false;
+            goto fallback;
+        }
+    }
+
+    if (matched_out != NULL) {
+        *matched_out = matched;
+    }
+    return mode;
+
+fallback:
+    if (matched_out != NULL) {
+        *matched_out = false;
+    }
+    return preferred;
+}
+
 static int select_mode(
     struct drmdev *drmdev,
     struct drm_connector **connector_out,
@@ -736,8 +875,8 @@ static int select_mode(
     struct drm_connector *connector;
     struct drm_encoder *encoder;
     struct drm_crtc *crtc;
-    drmModeModeInfo *mode, *mode_iter;
-    int ok;
+    drmModeModeInfo *mode;
+    bool matched;
 
     // find any connected connector
     for_each_connector_in_drmdev(drmdev, connector) {
@@ -751,67 +890,23 @@ static int select_mode(
         return EINVAL;
     }
 
-    mode = NULL;
-    if (desired_videomode != NULL) {
-        for_each_mode_in_connector(connector, mode_iter) {
-            char *modeline = NULL, *modeline_nohz = NULL;
-
-            ok = asprintf(&modeline, "%" PRIu16 "x%" PRIu16 "@%" PRIu32, mode_iter->hdisplay, mode_iter->vdisplay, mode_iter->vrefresh);
-            if (ok < 0) {
-                return ENOMEM;
-            }
-
-            ok = asprintf(&modeline_nohz, "%" PRIu16 "x%" PRIu16, mode_iter->hdisplay, mode_iter->vdisplay);
-            if (ok < 0) {
-                return ENOMEM;
-            }
-
-            if (streq(modeline, desired_videomode)) {
-                // Probably a bit superfluos, but the refresh rate can still vary in the decimal places.
-                if (mode == NULL || (mode_get_vrefresh(mode_iter) > mode_get_vrefresh(mode))) {
-                    mode = mode_iter;
-                }
-            } else if (streq(modeline_nohz, desired_videomode)) {
-                if (mode == NULL || (mode_get_vrefresh(mode_iter) > mode_get_vrefresh(mode))) {
-                    mode = mode_iter;
-                }
-            }
-
-            free(modeline);
-            free(modeline_nohz);
-        }
-
-        if (mode == NULL) {
-            LOG_ERROR("Didn't find a videomode matching \"%s\"! Falling back to display preferred mode.\n", desired_videomode);
-        }
-    }
-
-    // Find the preferred mode (GPU drivers _should_ always supply a preferred mode, but of course, they don't)
-    // Alternatively, find the mode with the highest width*height. If there are multiple modes with the same w*h,
-    // prefer higher refresh rates. After that, prefer progressive scanout modes.
+    mode = window_select_videomode(connector->variable_state.modes, connector->variable_state.n_modes, desired_videomode, &matched);
     if (mode == NULL) {
-        for_each_mode_in_connector(connector, mode_iter) {
-            if (mode_iter->type & DRM_MODE_TYPE_PREFERRED) {
-                mode = mode_iter;
-                break;
-            } else if (mode == NULL) {
-                mode = mode_iter;
-            } else {
-                int area = mode_iter->hdisplay * mode_iter->vdisplay;
-                int old_area = mode->hdisplay * mode->vdisplay;
-
-                if ((area > old_area) || ((area == old_area) && (mode_iter->vrefresh > mode->vrefresh)) ||
-                    ((area == old_area) && (mode_iter->vrefresh == mode->vrefresh) && ((mode->flags & DRM_MODE_FLAG_INTERLACE) == 0))) {
-                    mode = mode_iter;
-                }
-            }
-        }
-
-        if (mode == NULL) {
-            LOG_ERROR("Could not find a preferred output mode!\n");
-            return EINVAL;
-        }
+        LOG_ERROR("Could not find a preferred output mode!\n");
+        return EINVAL;
     }
+    if (!matched) {
+        LOG_ERROR("Didn't find a videomode matching \"%s\"! Falling back to display preferred mode.\n", desired_videomode);
+    }
+
+    fprintf(
+        stderr,
+        "flutter-pi: video mode request: %s; selected: %" PRIu16 "x%" PRIu16 "@%.3fHz\n",
+        desired_videomode == NULL ? "preferred" : desired_videomode,
+        mode->hdisplay,
+        mode->vdisplay,
+        mode_get_vrefresh(mode)
+    );
 
     ASSERT_NOT_NULL(mode);
 
