@@ -65,6 +65,14 @@ void test_preferred_cap_falls_back_when_no_mode_is_below_it() {
     assert_selection("preferred@50", 1, false);
 }
 
+void test_preferred_policy_falls_back_when_only_matching_modes_are_interlaced() {
+    reset_modes();
+    for (size_t i = 1; i < sizeof(modes) / sizeof(modes[0]); i++) {
+        modes[i].flags |= DRM_MODE_FLAG_INTERLACE;
+    }
+    assert_selection("preferred@max", 1, false);
+}
+
 void test_invalid_preferred_refresh_falls_back() {
     reset_modes();
     assert_selection("preferred@fast", 1, false);
@@ -92,6 +100,7 @@ int main() {
     RUN_TEST(test_preferred_max_uses_highest_progressive_refresh);
     RUN_TEST(test_preferred_numeric_refresh_is_a_cap);
     RUN_TEST(test_preferred_cap_falls_back_when_no_mode_is_below_it);
+    RUN_TEST(test_preferred_policy_falls_back_when_only_matching_modes_are_interlaced);
     RUN_TEST(test_invalid_preferred_refresh_falls_back);
     RUN_TEST(test_explicit_modes_keep_existing_matching_behavior);
     RUN_TEST(test_missing_preferred_mode_uses_largest_fallback_resolution);

@@ -763,23 +763,11 @@ static drmModeModeInfo *select_preferred_resolution_refresh(
     double refresh_cap
 ) {
     drmModeModeInfo *mode = NULL;
-    bool has_progressive_candidate = false;
 
     for (size_t i = 0; i < n_modes; i++) {
         drmModeModeInfo *candidate = &modes[i];
-        if (candidate->hdisplay != preferred->hdisplay || candidate->vdisplay != preferred->vdisplay ||
+        if (candidate->hdisplay != preferred->hdisplay || candidate->vdisplay != preferred->vdisplay || !mode_is_progressive(candidate) ||
             (has_refresh_cap && candidate->vrefresh > refresh_cap)) {
-            continue;
-        }
-        if (mode_is_progressive(candidate)) {
-            has_progressive_candidate = true;
-        }
-    }
-
-    for (size_t i = 0; i < n_modes; i++) {
-        drmModeModeInfo *candidate = &modes[i];
-        if (candidate->hdisplay != preferred->hdisplay || candidate->vdisplay != preferred->vdisplay ||
-            (has_refresh_cap && candidate->vrefresh > refresh_cap) || (has_progressive_candidate && !mode_is_progressive(candidate))) {
             continue;
         }
         if (mode == NULL || mode_get_vrefresh(candidate) > mode_get_vrefresh(mode)) {
@@ -1042,9 +1030,10 @@ MUST_CHECK struct window *kms_window_new(
         has_dimensions = true;
         width_mm = selected_connector->variable_state.width_mm;
         height_mm = selected_connector->variable_state.height_mm;
-    } else if (selected_connector->type == DRM_MODE_CONNECTOR_DSI
-        && selected_connector->variable_state.width_mm == 0
-        && selected_connector->variable_state.height_mm == 0) {
+    } else if (
+        selected_connector->type == DRM_MODE_CONNECTOR_DSI && selected_connector->variable_state.width_mm == 0 &&
+        selected_connector->variable_state.height_mm == 0
+    ) {
         // assume this is the official Raspberry Pi DSI display.
         has_dimensions = true;
         width_mm = 155;
