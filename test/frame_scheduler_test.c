@@ -146,24 +146,30 @@ void test_vsync_request_deferred_until_scanout() {
     frame_scheduler_unref(s);
 }
 
-void test_vsync_reply_waits_while_queued_frame_present() {
+void test_vsync_reply_does_not_wait_behind_queued_frame() {
     reset_log();
     struct frame_scheduler *s = make_scheduler();
 
-    int frame1, frame2;
+    int frame1, frame2, frame3;
     frame_scheduler_present_frame(s, on_present, &frame1, on_cancel);
     frame_scheduler_present_frame(s, on_present, &frame2, on_cancel);
     frame_scheduler_on_fl_vsync_request(s, 0x1234);
 
-    // First scanout presents the queued frame2; baton stays pending.
+    // The scanout both presents queued frame2 and replies to Flutter so it can
+    // build the frame after it. Waiting another scanout here limits steady
+    // animation to two frames per three vblanks.
     frame_scheduler_on_scanout(s, true, 1000);
     TEST_ASSERT_EQUAL_INT(2, log_.n_presents);
-    TEST_ASSERT_EQUAL_INT(0, log_.n_vsync_replies);
-
-    // Second scanout has nothing queued; baton is replied.
-    frame_scheduler_on_scanout(s, true, 2000);
     TEST_ASSERT_EQUAL_INT(1, log_.n_vsync_replies);
     TEST_ASSERT_EQUAL(0x1234, log_.last_baton);
+    TEST_ASSERT_EQUAL_UINT64(1000, log_.last_frame_start_ns);
+
+    // The newly produced frame is still bounded by the one-frame mailbox.
+    frame_scheduler_present_frame(s, on_present, &frame3, on_cancel);
+    TEST_ASSERT_EQUAL_INT(2, log_.n_presents);
+    frame_scheduler_on_scanout(s, true, 2000);
+    TEST_ASSERT_EQUAL_INT(3, log_.n_presents);
+    TEST_ASSERT_EQUAL_PTR(&frame3, log_.last_present_userdata);
 
     frame_scheduler_unref(s);
 }
@@ -211,7 +217,7 @@ int main() {
     RUN_TEST(test_newer_frame_displaces_queued_frame);
     RUN_TEST(test_vsync_request_replied_immediately_when_idle);
     RUN_TEST(test_vsync_request_deferred_until_scanout);
-    RUN_TEST(test_vsync_reply_waits_while_queued_frame_present);
+    RUN_TEST(test_vsync_reply_does_not_wait_behind_queued_frame);
     RUN_TEST(test_present_failure_resets_pipeline);
     RUN_TEST(test_spurious_scanout_is_ignored);
     return UNITY_END();

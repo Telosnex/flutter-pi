@@ -334,10 +334,9 @@ static void frame_scheduler_maybe_report_stats_locked(struct frame_scheduler *sc
         max = scheduler->stats.intervals_us[n - 1];
     }
 
-    uint32_t avg_commit_latency =
-        scheduler->stats.n_commit_latencies != 0 ?
-            (uint32_t) (scheduler->stats.commit_latency_sum_us / scheduler->stats.n_commit_latencies) :
-            0;
+    uint32_t avg_commit_latency = scheduler->stats.n_commit_latencies != 0 ?
+                                      (uint32_t) (scheduler->stats.commit_latency_sum_us / scheduler->stats.n_commit_latencies) :
+                                      0;
 
     fprintf(
         stderr,
@@ -417,10 +416,12 @@ void frame_scheduler_on_scanout(struct frame_scheduler *scheduler, bool has_time
     frame_scheduler_record_scanout_stats_locked(scheduler, timestamp_ns);
 
     if (scheduler->has_queued_frame) {
-        // Present the queued frame right away; we remain in the
-        // waiting-for-scanout state. A pending vsync request stays pending;
-        // it'll be replied to on a later flip. (Backpressure: with double
-        // buffering we don't want flutter to render further ahead.)
+        // Present the queued frame right away and keep the pipeline in the
+        // waiting-for-scanout state. We still reply to a pending engine-vsync
+        // request below: withholding it here inserts an empty vblank whenever
+        // a frame is queued (two frames per three vblanks under steady load).
+        // The one-frame mailbox remains the backpressure bound; if rendering
+        // gets ahead, a newer frame displaces the stale queued frame.
         present_cb = scheduler->queued_frame.present_cb;
         present_userdata = scheduler->queued_frame.userdata;
         scheduler->has_queued_frame = false;
@@ -430,10 +431,13 @@ void frame_scheduler_on_scanout(struct frame_scheduler *scheduler, bool has_time
         scheduler->stats.last_present_ns = get_monotonic_time();
     } else {
         scheduler->waiting_for_scanout = false;
-
-        pending_baton = scheduler->pending_vsync_baton;
-        scheduler->pending_vsync_baton = 0;
     }
+
+    // Every observed scanout is a usable vsync edge, including one where a
+    // previously queued frame is submitted. Replying here lets Flutter build
+    // the following frame while the just-submitted frame is in flight.
+    pending_baton = scheduler->pending_vsync_baton;
+    scheduler->pending_vsync_baton = 0;
 
     frame_scheduler_maybe_report_stats_locked(scheduler, timestamp_ns);
 
