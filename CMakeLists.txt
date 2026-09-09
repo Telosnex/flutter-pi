@@ -134,6 +134,7 @@ add_library(
   src/cursor.c
   src/keyboard.c
   src/user_input.c
+  src/user_input_scroll.c
   src/locales.c
   src/notifier_listener.c
   src/pixel_format.c

@@ -18,6 +18,7 @@
 #include "compositor_ng.h"
 #include "flutter-pi.h"
 #include "keyboard.h"
+#include "user_input_scroll.h"
 #include "util/collection.h"
 #include "util/logging.h"
 
@@ -28,6 +29,7 @@ struct input_device_data {
     struct keyboard_state *keyboard_state;
     int64_t buttons;
     uint64_t timestamp;
+    struct user_input_scroll scroll;
 
     /**
      * @brief Whether libinput has ever emitted any pointer / mouse events
@@ -60,6 +62,7 @@ struct user_input {
     struct libinput *libinput;
     struct keyboard_config *kbdcfg;
     int64_t next_unused_flutter_device_id;
+    bool touchpad_natural_scroll;
 
     /// TODO: Maybe fetch the transform, display dimensions, cursor pos dynamically using a callback instead?
 
@@ -329,6 +332,11 @@ struct user_input *user_input_new(
     input->libinput = libinput;
     input->kbdcfg = kbdcfg;
     input->next_unused_flutter_device_id = 0;
+    input->touchpad_natural_scroll = true;
+    if (!user_input_scroll_parse_natural(getenv("FLUTTER_PI_TOUCHPAD_NATURAL_SCROLL"), &input->touchpad_natural_scroll)) {
+        LOG_ERROR("FLUTTER_PI_TOUCHPAD_NATURAL_SCROLL must be 0 or 1; using natural scrolling.\n");
+    }
+    LOG_DEBUG("Touchpad pan gestures: natural scrolling %s.\n", input->touchpad_natural_scroll ? "enabled" : "disabled");
 
     user_input_set_transform(input, display_to_view_transform, view_to_display_transform, display_width, display_height);
 
@@ -553,6 +561,7 @@ static int on_device_added(struct user_input *input, struct libinput_event *even
     data->has_emitted_pointer_events = false;
     data->tip = false;
     data->positions = NULL;
+    data->scroll = (struct user_input_scroll){ .device_id = -1 };
 
     libinput_device_set_user_data(device, data);
 
@@ -562,8 +571,9 @@ static int on_device_added(struct user_input *input, struct libinput_event *even
         // mouse event, as some devices will erroneously have a LIBINPUT_DEVICE_CAP_POINTER
         // even though they aren't mice. (My keyboard for example is a mouse smh)
 
-        // reserve one id for the mouse pointer
-        // input->next_unused_flutter_device_id++;
+        // Reserve a separate trackpad gesture ID. Do not alias pan/zoom state
+        // with the shared mouse cursor's movement or button state.
+        data->scroll.device_id = input->next_unused_flutter_device_id++;
     }
 
     if (libinput_device_has_capability(device, LIBINPUT_DEVICE_CAP_TOUCH)) {
@@ -644,6 +654,11 @@ static int on_device_removed(struct user_input *input, struct libinput_event *ev
     }
 
     if (libinput_device_has_capability(device, LIBINPUT_DEVICE_CAP_POINTER)) {
+        if (emit_flutter_events) {
+            FlutterPointerEvent events[USER_INPUT_SCROLL_MAX_EVENTS];
+            size_t count = user_input_scroll_remove(&data->scroll, timestamp, events);
+            emit_pointer_events(input, events, count);
+        }
         if (data->has_emitted_pointer_events) {
             input->n_cursor_devices--;
             if (emit_flutter_events) {
@@ -1037,26 +1052,38 @@ static int on_mouse_axis_event(struct user_input *input, struct libinput_event *
     // we need to transform them again
     pos_view = transform_point(input->display_to_view_transform, VEC2F(input->cursor_x, input->cursor_y));
 
-    double scroll_x = libinput_event_pointer_has_axis(pointer_event, LIBINPUT_POINTER_AXIS_SCROLL_HORIZONTAL) ?
-                          libinput_event_pointer_get_axis_value(pointer_event, LIBINPUT_POINTER_AXIS_SCROLL_HORIZONTAL) :
-                          0.0;
+    bool has_x = libinput_event_pointer_has_axis(pointer_event, LIBINPUT_POINTER_AXIS_SCROLL_HORIZONTAL);
+    bool has_y = libinput_event_pointer_has_axis(pointer_event, LIBINPUT_POINTER_AXIS_SCROLL_VERTICAL);
+    struct user_input_scroll_sample sample = {
+        .timestamp = timestamp,
+        .x = pos_view.x,
+        .y = pos_view.y,
+        .has_x = has_x,
+        .has_y = has_y,
+        .delta_x = has_x ? libinput_event_pointer_get_axis_value(pointer_event, LIBINPUT_POINTER_AXIS_SCROLL_HORIZONTAL) : 0,
+        .delta_y = has_y ? libinput_event_pointer_get_axis_value(pointer_event, LIBINPUT_POINTER_AXIS_SCROLL_VERTICAL) : 0,
+    };
 
-    double scroll_y = libinput_event_pointer_has_axis(pointer_event, LIBINPUT_POINTER_AXIS_SCROLL_VERTICAL) ?
-                          libinput_event_pointer_get_axis_value(pointer_event, LIBINPUT_POINTER_AXIS_SCROLL_VERTICAL) :
-                          0.0;
+    data->timestamp = timestamp;
+    if (!data->has_emitted_pointer_events) {
+        data->has_emitted_pointer_events = true;
+        input->n_cursor_devices++;
+        maybe_enable_mouse_cursor(input, timestamp);
+    }
 
-    emit_pointer_event(
-        input,
-        make_mouse_event(
-            data->buttons & kFlutterPointerButtonMousePrimary ? kMove : kHover,
-            timestamp,
-            pos_view,
-            input->cursor_flutter_device_id,
-            kFlutterPointerSignalKindScroll,
-            VEC2F(scroll_x / 15.0 * 53.0, scroll_y / 15.0 * 53.0),
-            data->buttons
-        )
-    );
+    if (libinput_event_pointer_get_axis_source(pointer_event) == LIBINPUT_POINTER_AXIS_SOURCE_FINGER) {
+        // Normalize libinput's configured direction back to physical finger
+        // motion. Our preference applies only to finger scrolling, never wheels.
+        if (libinput_device_config_scroll_get_natural_scroll_enabled(device)) {
+            sample.delta_x = -sample.delta_x;
+            sample.delta_y = -sample.delta_y;
+        }
+        FlutterPointerEvent events[USER_INPUT_SCROLL_MAX_EVENTS];
+        size_t count = user_input_scroll_finger(&data->scroll, &sample, input->touchpad_natural_scroll, events);
+        emit_pointer_events(input, events, count);
+    } else {
+        emit_pointer_event(input, user_input_scroll_wheel(&sample, input->cursor_flutter_device_id, data->buttons));
+    }
 
     return 0;
 }
@@ -1393,6 +1420,9 @@ static int process_libinput_events(struct user_input *input, uint64_t timestamp)
                     goto fail_destroy_event;
                 }
                 break;
+            // Consume only legacy AXIS events (also provided by libinput >=1.19).
+            // SCROLL_FINGER/WHEEL/CONTINUOUS are duplicate streams and must not
+            // be handled as well. AXIS keeps the existing wheel behavior intact.
             case LIBINPUT_EVENT_POINTER_AXIS:
                 ok = on_mouse_axis_event(input, event);
                 if (ok != 0) {
@@ -1501,8 +1531,8 @@ int user_input_on_fd_ready(struct user_input *input) {
     assert(input != NULL);
 
     // get a timestamp because some libinput events don't provide one
-    // needs to be in milliseconds, since that's what the other libinput events
-    // use and what flutter pointer events require
+    // Convert monotonic nanoseconds to microseconds, matching libinput's
+    // get_time_usec and FlutterPointerEvent.timestamp.
     timestamp = get_monotonic_time() / 1000;
 
     // tell libinput about new events
