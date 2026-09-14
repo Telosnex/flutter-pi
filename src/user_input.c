@@ -63,6 +63,7 @@ struct user_input {
     struct keyboard_config *kbdcfg;
     int64_t next_unused_flutter_device_id;
     bool touchpad_natural_scroll;
+    double device_pixel_ratio;
 
     /// TODO: Maybe fetch the transform, display dimensions, cursor pos dynamically using a callback instead?
 
@@ -284,7 +285,8 @@ struct user_input *user_input_new(
     const struct mat3f *display_to_view_transform,
     const struct mat3f *view_to_display_transform,
     unsigned int display_width,
-    unsigned int display_height
+    unsigned int display_height,
+    double device_pixel_ratio
 ) {
     struct keyboard_config *kbdcfg;
     struct user_input *input;
@@ -338,7 +340,8 @@ struct user_input *user_input_new(
     }
     LOG_DEBUG("Touchpad pan gestures: natural scrolling %s.\n", input->touchpad_natural_scroll ? "enabled" : "disabled");
 
-    user_input_set_transform(input, display_to_view_transform, view_to_display_transform, display_width, display_height);
+    user_input_set_transform(input, display_to_view_transform, view_to_display_transform, display_width, display_height, device_pixel_ratio);
+    fprintf(stderr, "flutter-pi: trackpad desktop parity: 5.3 logical pixels/axis unit, DPR=%g; pan gestures retained.\n", device_pixel_ratio);
 
     input->n_cursor_devices = 0;
     input->cursor_flutter_device_id = -1;
@@ -407,7 +410,8 @@ void user_input_set_transform(
     const struct mat3f *display_to_view_transform,
     const struct mat3f *view_to_display_transform,
     unsigned int display_width,
-    unsigned int display_height
+    unsigned int display_height,
+    double device_pixel_ratio
 ) {
     assert(input != NULL);
     assert(display_to_view_transform != NULL);
@@ -419,6 +423,7 @@ void user_input_set_transform(
     input->view_to_display_transform_nontranslating.transY = 0.0;
     input->display_width = display_width;
     input->display_height = display_height;
+    input->device_pixel_ratio = device_pixel_ratio;
 }
 
 int user_input_get_fd(struct user_input *input) {
@@ -574,6 +579,19 @@ static int on_device_added(struct user_input *input, struct libinput_event *even
         // Reserve a separate trackpad gesture ID. Do not alias pan/zoom state
         // with the shared mouse cursor's movement or button state.
         data->scroll.device_id = input->next_unused_flutter_device_id++;
+
+        // Match labwc: light taps produce ordinary pointer button events.
+        // This is per-libinput-context and reapplied after hotplug/resume;
+        // no kernel or desktop configuration is changed.
+        if (libinput_device_config_tap_get_finger_count(device) > 0) {
+            enum libinput_config_status status = libinput_device_config_tap_set_enabled(device, LIBINPUT_CONFIG_TAP_ENABLED);
+            if (status != LIBINPUT_CONFIG_STATUS_SUCCESS ||
+                libinput_device_config_tap_get_enabled(device) != LIBINPUT_CONFIG_TAP_ENABLED) {
+                LOG_ERROR("Could not enable touchpad tap-to-click: %s\n", libinput_config_status_to_str(status));
+            } else {
+                fprintf(stderr, "flutter-pi: tap-to-click enabled: %s\n", libinput_device_get_name(device));
+            }
+        }
     }
 
     if (libinput_device_has_capability(device, LIBINPUT_DEVICE_CAP_TOUCH)) {
@@ -1078,6 +1096,7 @@ static int on_mouse_axis_event(struct user_input *input, struct libinput_event *
             sample.delta_x = -sample.delta_x;
             sample.delta_y = -sample.delta_y;
         }
+        user_input_scroll_apply_desktop_units(&sample, input->device_pixel_ratio);
         FlutterPointerEvent events[USER_INPUT_SCROLL_MAX_EVENTS];
         size_t count = user_input_scroll_finger(&data->scroll, &sample, input->touchpad_natural_scroll, events);
         emit_pointer_events(input, events, count);

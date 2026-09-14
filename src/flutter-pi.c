@@ -2699,7 +2699,8 @@ struct flutterpi *flutterpi_new_from_args(int argc, char **argv) {
         &geometry.display_to_view_transform,
         &geometry.view_to_display_transform,
         geometry.display_size.x,
-        geometry.display_size.y
+        geometry.display_size.y,
+        geometry.device_pixel_ratio
     );
     if (input == NULL) {
         LOG_ERROR("Couldn't initialize user input. flutter-pi will run without user input.\n");

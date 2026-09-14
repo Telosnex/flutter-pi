@@ -50,4 +50,11 @@ size_t user_input_scroll_remove(
 // Retains the existing mouse-wheel/continuous-scroll conversion and direction.
 FlutterPointerEvent user_input_scroll_wheel(const struct user_input_scroll_sample *sample, int64_t device_id, int64_t buttons);
 
+// Convert libinput finger axis units into Flutter physical pan pixels.
+// Matches GTK Wayland (axis / 10) + Flutter Linux (delta * 53 * scale).
+// Apply ONLY to finger scrolls, before cumulative pan tracking.
+void user_input_scroll_apply_desktop_units(
+    struct user_input_scroll_sample *sample, double device_pixel_ratio
+);
+
 #endif

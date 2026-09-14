@@ -15,3 +15,8 @@ trap 'rm -rf "$build"' EXIT
   "$root/test/user_input_scroll_test.c" "$root/src/user_input_scroll.c" \
   "$root/third_party/Unity/src/unity.c" -lm -o "$build/user_input_scroll_test"
 "$build/user_input_scroll_test"
+"${CC:-cc}" -std=c11 -Wall -Wextra -Werror -g -fsanitize=address,undefined \
+  -I"$root/src" -I"$root/third_party/flutter_embedder_header/include" \
+  "$root/test/user_input_scroll_units_test.c" "$root/src/user_input_scroll.c" \
+  -lm -o "$build/user_input_scroll_units_test"
+"$build/user_input_scroll_units_test"

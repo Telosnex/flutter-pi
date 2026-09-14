@@ -81,7 +81,8 @@ struct user_input *user_input_new(
     const struct mat3f *display_to_view_transform,
     const struct mat3f *view_to_display_transform,
     unsigned int display_width,
-    unsigned int display_height
+    unsigned int display_height,
+    double device_pixel_ratio
 );
 
 /**
@@ -102,7 +103,8 @@ void user_input_set_transform(
     const struct mat3f *display_to_view_transform,
     const struct mat3f *view_to_display_transform,
     unsigned int display_width,
-    unsigned int display_height
+    unsigned int display_height,
+    double device_pixel_ratio
 );
 
 /**

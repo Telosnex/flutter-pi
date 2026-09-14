@@ -2,6 +2,8 @@
 #include "user_input_scroll.h"
 
 #include <string.h>
+#include <math.h>
+#include <assert.h>
 
 bool user_input_scroll_parse_natural(const char *value, bool *natural) {
     if (value == NULL || strcmp(value, "1") == 0) {
@@ -113,4 +115,17 @@ FlutterPointerEvent user_input_scroll_wheel(const struct user_input_scroll_sampl
         .device_kind = kFlutterPointerDeviceKindMouse,
         .buttons = buttons,
     };
+}
+
+void user_input_scroll_apply_desktop_units(
+    struct user_input_scroll_sample *sample, double device_pixel_ratio
+) {
+    assert(isfinite(device_pixel_ratio) && device_pixel_ratio > 0);
+    // GTK 3.24.49 gdkdevice-wayland.c: pointer_handle_axis divides by 10.
+    // Flutter 3.47.1 fl_scrolling_manager.cc multiplies by 53 and output scale.
+    // Dart divides physical pan by DPR, yielding 5.3 logical px per axis unit.
+    // This normalizes the adapter; it does not change physics or sample times.
+    const double physical_pixels_per_axis_unit = (53.0 / 10.0) * device_pixel_ratio;
+    sample->delta_x = sample->has_x ? sample->delta_x * physical_pixels_per_axis_unit : 0;
+    sample->delta_y = sample->has_y ? sample->delta_y * physical_pixels_per_axis_unit : 0;
 }
