@@ -317,6 +317,7 @@ if (BUILD_GSTREAMER_VIDEO_PLAYER_PLUGIN)
       pkg_check_modules(LIBGSTREAMER_ALLOCATORS IMPORTED_TARGET gstreamer-allocators-1.0)
       pkg_check_modules(LIBGSTREAMER_VIDEO IMPORTED_TARGET gstreamer-video-1.0)
       pkg_check_modules(WPEWEBKIT IMPORTED_TARGET wpe-webkit-2.0)
+      pkg_check_modules(LIBGSTREAMER_GL IMPORTED_TARGET gstreamer-gl-1.0)
     else()
       pkg_check_modules(LIBGSTREAMER REQUIRED IMPORTED_TARGET gstreamer-1.0)
       pkg_check_modules(LIBGSTREAMER_PLUGINS_BASE REQUIRED IMPORTED_TARGET gstreamer-plugins-base-1.0)
@@ -324,9 +325,10 @@ if (BUILD_GSTREAMER_VIDEO_PLAYER_PLUGIN)
       pkg_check_modules(LIBGSTREAMER_ALLOCATORS REQUIRED IMPORTED_TARGET gstreamer-allocators-1.0)
       pkg_check_modules(LIBGSTREAMER_VIDEO REQUIRED IMPORTED_TARGET gstreamer-video-1.0)
       pkg_check_modules(WPEWEBKIT REQUIRED IMPORTED_TARGET wpe-webkit-2.0)
+      pkg_check_modules(LIBGSTREAMER_GL REQUIRED IMPORTED_TARGET gstreamer-gl-1.0)
     endif()
 
-    if (LIBGSTREAMER_FOUND AND LIBGSTREAMER_PLUGINS_BASE_FOUND AND LIBGSTREAMER_APP_FOUND AND LIBGSTREAMER_ALLOCATORS_FOUND AND LIBGSTREAMER_VIDEO_FOUND AND WPEWEBKIT_FOUND)
+    if (LIBGSTREAMER_FOUND AND LIBGSTREAMER_PLUGINS_BASE_FOUND AND LIBGSTREAMER_APP_FOUND AND LIBGSTREAMER_ALLOCATORS_FOUND AND LIBGSTREAMER_VIDEO_FOUND AND WPEWEBKIT_FOUND AND LIBGSTREAMER_GL_FOUND)
       # There's no other way to query the libinput version (in code) somehow.
       # So we need to roll our own libinput version macro
       string(REPLACE "." ";" LIBGSTREAMER_VERSION_AS_LIST ${LIBGSTREAMER_VERSION})
@@ -338,6 +340,7 @@ if (BUILD_GSTREAMER_VIDEO_PLAYER_PLUGIN)
         src/plugins/gstreamer_video_player/plugin.c
         src/plugins/gstreamer_video_player/player.c
         src/plugins/gstreamer_video_player/frame.c
+        src/plugins/gstreamer_video_player/webview_gpu.c
       )
       target_link_libraries(flutterpi_module PUBLIC
         PkgConfig::LIBGSTREAMER
@@ -345,6 +348,7 @@ if (BUILD_GSTREAMER_VIDEO_PLAYER_PLUGIN)
         PkgConfig::LIBGSTREAMER_APP
         PkgConfig::LIBGSTREAMER_ALLOCATORS
         PkgConfig::LIBGSTREAMER_VIDEO
+        PkgConfig::LIBGSTREAMER_GL
         PkgConfig::WPEWEBKIT
       )
     else()

@@ -26,6 +26,7 @@
 #include "platformchannel.h"
 #include "pluginregistry.h"
 #include "plugins/gstreamer_video_player.h"
+#include "plugins/gstreamer_video_player/webview_gpu.h"
 #include "texture_registry.h"
 #include "util/collection.h"
 #include "util/logging.h"
@@ -186,6 +187,10 @@ struct gstplayer {
     /// Frames pushed to the plane before the compositor ever presented it.
     /// Keeps the texture path alive as a fallback, and says so out loud.
     int plane_frames_without_present;
+
+    /// Set when FLUTTERPI_WEBVIEW_GPU is also set: WebKit renders with the GPU,
+    /// and frames are copied GPU to GPU into scanout buffers. NULL otherwise.
+    struct webview_gpu *webview_gpu;
 
     struct frame_interface *frame_interface;
 
@@ -453,6 +458,10 @@ static void on_configure_web_view(GstElement *websrc, GObject *object, void *use
     if (manager == NULL) {
         LOG_ERROR("Could not get the WPE WebKit user content manager.\n");
         return;
+    }
+
+    if (player->webview_gpu != NULL) {
+        webview_gpu_configure_web_view(object);
     }
 
     g_signal_connect(webview, "load-changed", G_CALLBACK(on_web_load_changed), player);
@@ -1157,6 +1166,28 @@ static GstFlowReturn on_appsink_new_sample(GstAppSink *appsink, void *userdata) 
         return GST_FLOW_FLUSHING;
     }
 
+    if (player->webview_gpu != NULL && webview_gpu_sample_has_image(sample)) {
+        struct dmabuf dmabuf;
+        int ok;
+
+        // GL frames have no texture fallback: frame_new() only takes system or
+        // dmabuf memory. The plane is the only consumer.
+        ok = webview_gpu_copy_sample(player->webview_gpu, sample, &dmabuf);
+        gst_sample_unref(sample);
+        if (ok == 0) {
+            ok = dmabuf_surface_push_dmabuf(player->dmabuf_surface, &dmabuf, webview_gpu_release_dmabuf);
+            if (ok != 0) {
+                webview_gpu_release_dmabuf(&dmabuf);
+            }
+        } else if (ok != EAGAIN) {
+            LOG_ERROR("Could not copy the webview frame on the GPU: %s\n", strerror(ok));
+        }
+        if (!dmabuf_surface_was_presented(player->dmabuf_surface) && ++player->plane_frames_without_present == 120) {
+            LOG_ERROR("Platform view still not presented after 120 GPU frames. Nothing is compositing it.\n");
+        }
+        return GST_FLOW_OK;
+    }
+
     if (player->dmabuf_surface != NULL) {
         struct dmabuf dmabuf;
         int ok;
@@ -1281,6 +1312,14 @@ static int init(struct gstplayer *player, bool force_sw_decoders) {
         }
     }
 
+    if (player->webview_gpu != NULL && (websrc == NULL || webview_gpu_configure_pipeline(player->webview_gpu, pipeline, websrc) != 0)) {
+        if (websrc != NULL) {
+            LOG_ERROR("Could not set up webview GPU frames. Using system-memory frames.\n");
+        }
+        webview_gpu_unref(player->webview_gpu);
+        player->webview_gpu = NULL;
+    }
+
     if (player->video_uri != NULL) {
         if (src != NULL) {
             g_object_set(G_OBJECT(src), "uri", player->video_uri, NULL);
@@ -1318,7 +1357,9 @@ static int init(struct gstplayer *player, bool force_sw_decoders) {
     // configure our caps
     // we only accept video formats that we can actually upload to EGL
     GstCaps *caps = gst_caps_new_empty();
-    if (player->frame_interface == NULL) {
+    if (player->webview_gpu != NULL) {
+        gst_caps_append(caps, webview_gpu_appsink_caps());
+    } else if (player->frame_interface == NULL) {
         // Plane path: no EGL import, frames are copied into an ARGB8888
         // scanout BO, so accept the packed 32-bit formats WPE produces.
         gst_caps_append(caps, gst_caps_new_simple("video/x-raw", "format", G_TYPE_STRING, "BGRA", NULL));
@@ -1542,7 +1583,8 @@ static struct gstplayer *gstplayer_new(struct flutterpi *flutterpi, const char *
     // texture. Renderer-agnostic, so this is what survives under Vulkan.
     player->dmabuf_surface = NULL;
     player->platform_view_id = 0;
-        player->plane_frames_without_present = 0;
+    player->plane_frames_without_present = 0;
+    player->webview_gpu = NULL;
     if (getenv("FLUTTERPI_WEBVIEW_ON_PLANE") != NULL) {
         player->dmabuf_surface = dmabuf_surface_new(
             flutterpi_get_tracer(player->flutterpi),
@@ -1557,6 +1599,9 @@ static struct gstplayer *gstplayer_new(struct flutterpi *flutterpi, const char *
                 player->platform_view_id,
                 CAST_SURFACE_UNCHECKED(player->dmabuf_surface)
             );
+            if (webview_gpu_requested()) {
+                player->webview_gpu = webview_gpu_new(flutterpi_get_gbm_device(player->flutterpi));
+            }
         }
     }
 
@@ -1658,6 +1703,7 @@ void gstplayer_destroy(struct gstplayer *player) {
     if (player->frame_interface != NULL) {
         frame_interface_unref(player->frame_interface);
     }
+    webview_gpu_unref(player->webview_gpu);
     texture_destroy(player->texture);
     free(player);
 }
