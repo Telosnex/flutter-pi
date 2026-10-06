@@ -53,6 +53,9 @@ bool webview_gpu_sample_has_image(GstSample *sample);
 /// screen; drop the frame in that case.
 int webview_gpu_copy_sample(struct webview_gpu *gpu, GstSample *sample, struct dmabuf *dmabuf_out);
 
+/// Return the source image while its WPE view is still alive, including drops.
+void webview_gpu_release_sample(GstSample *sample);
+
 void webview_gpu_release_dmabuf(struct dmabuf *dmabuf);
 
 #endif  // _FLUTTERPI_SRC_PLUGINS_GSTREAMER_VIDEO_PLAYER_WEBVIEW_GPU_H

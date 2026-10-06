@@ -1173,6 +1173,7 @@ static GstFlowReturn on_appsink_new_sample(GstAppSink *appsink, void *userdata) 
         // GL frames have no texture fallback: frame_new() only takes system or
         // dmabuf memory. The plane is the only consumer.
         ok = webview_gpu_copy_sample(player->webview_gpu, sample, &dmabuf);
+        webview_gpu_release_sample(sample);
         gst_sample_unref(sample);
         if (ok == 0) {
             ok = dmabuf_surface_push_dmabuf(player->dmabuf_surface, &dmabuf, webview_gpu_release_dmabuf);

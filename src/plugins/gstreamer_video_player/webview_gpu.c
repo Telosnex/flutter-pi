@@ -618,8 +618,7 @@ static GLuint source_texture(struct webview_gpu *gpu, GstEGLImage *gst_image, in
 }
 
 int webview_gpu_copy_sample(struct webview_gpu *gpu, GstSample *sample, struct dmabuf *dmabuf_out) {
-    GstMemory *memory = NULL;
-    GstEGLImage *gst_image = sample_image(sample, &memory);
+    GstEGLImage *gst_image = sample_image(sample, NULL);
     struct slot *slot = NULL;
     GstVideoInfo info;
     GLuint texture;
@@ -674,12 +673,6 @@ int webview_gpu_copy_sample(struct webview_gpu *gpu, GstSample *sample, struct d
     // let this thread return before the GPU finishes.
     glFinish();
 
-    // Hand the WebKit buffer back now. wpevideosrc otherwise keeps the image on
-    // its pooled GL memory until that memory is refilled, or until the pool is
-    // freed after the WPE view is gone: that late release dereferences the
-    // destroyed view and crashes (gst-plugins-bad 1.26, wpevideosrc GL mode).
-    gst_mini_object_set_qdata(GST_MINI_OBJECT_CAST(memory), g_quark_from_static_string(WPE_EGL_IMAGE_QUARK), NULL, NULL);
-
     memset(dmabuf_out, 0, sizeof *dmabuf_out);
     dmabuf_out->format = PIXFMT_XRGB8888;
     dmabuf_out->width = width;
@@ -704,6 +697,15 @@ out_unlock:
     pthread_mutex_unlock(&gpu->lock);
     atomic_store(&slot->busy, false);
     return ok;
+}
+
+void webview_gpu_release_sample(GstSample *sample) {
+    GstMemory *memory = NULL;
+    if (sample_image(sample, &memory) != NULL) {
+        // Release even dropped/failed copies. Otherwise pooled memory can keep
+        // the image until after the WPE view is destroyed and crash on close.
+        gst_mini_object_set_qdata(GST_MINI_OBJECT_CAST(memory), g_quark_from_static_string(WPE_EGL_IMAGE_QUARK), NULL, NULL);
+    }
 }
 
 void webview_gpu_release_dmabuf(struct dmabuf *dmabuf) {
