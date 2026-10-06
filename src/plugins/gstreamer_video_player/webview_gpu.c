@@ -74,6 +74,8 @@ struct slot {
     uint64_t modifier;
     void *image;
     GLuint texture, framebuffer;
+    /// When the copy into this slot finished (diagnostics).
+    _Atomic uint64_t filled_ns;
 };
 
 struct source_entry {
@@ -113,6 +115,15 @@ struct webview_gpu {
     bool log_stats;
     uint64_t copy_ns_total, copy_ns_max;
     uint64_t window_start_ns, window_frames, window_dropped, window_copy_ns, window_copy_max_ns;
+
+    /// Drop diagnostics. A drop with every held slot younger than ~2 refreshes
+    /// means WebKit delivered frames faster than the screen can show them
+    /// (harmless); an old held slot means something kept a buffer too long.
+    uint64_t last_arrival_ns;
+    uint64_t window_fast_arrivals; // < 8 ms after the previous WebKit frame
+    uint64_t window_drops_burst, window_drops_stuck, window_drop_oldest_max_ns;
+    /// Updated from the display thread on release.
+    _Atomic uint64_t window_releases, window_hold_ns, window_hold_max_ns;
 };
 
 static uint64_t now_ns(void) {
@@ -678,6 +689,12 @@ static int copy_common(
     EGLSurface saved_draw = eglGetCurrentSurface(EGL_DRAW);
     EGLSurface saved_read = eglGetCurrentSurface(EGL_READ);
 
+    {
+        uint64_t arrival = now_ns();
+        if (gpu->last_arrival_ns != 0 && arrival - gpu->last_arrival_ns < 8000000ull) gpu->window_fast_arrivals++;
+        gpu->last_arrival_ns = arrival;
+    }
+
     for (int i = 0; i < N_SLOTS; i++) {
         bool expected = false;
         if (atomic_compare_exchange_strong(&gpu->slots[i].busy, &expected, true)) {
@@ -686,6 +703,14 @@ static int copy_common(
         }
     }
     if (slot == NULL) {
+        uint64_t now = now_ns(), oldest = 0;
+        for (int i = 0; i < N_SLOTS; i++) {
+            uint64_t filled = atomic_load(&gpu->slots[i].filled_ns);
+            if (filled != 0 && now - filled > oldest) oldest = now - filled;
+        }
+        if (oldest < 34000000ull) gpu->window_drops_burst++;
+        else gpu->window_drops_stuck++;
+        if (oldest > gpu->window_drop_oldest_max_ns) gpu->window_drop_oldest_max_ns = oldest;
         gpu->n_dropped++;
         gpu->window_dropped++;
         return EAGAIN;
@@ -734,6 +759,7 @@ static int copy_common(
     dmabuf_out->has_modifiers = slot->modifier != DRM_FORMAT_MOD_INVALID;
     dmabuf_out->modifiers[0] = slot->modifier;
     dmabuf_out->userdata = slot;
+    atomic_store(&slot->filled_ns, now_ns());
     webview_gpu_ref(gpu);
     gpu->n_frames++;
     {
@@ -755,6 +781,24 @@ static int copy_common(
                 width,
                 height
             );
+            {
+                uint64_t releases = atomic_exchange(&gpu->window_releases, 0);
+                uint64_t hold = atomic_exchange(&gpu->window_hold_ns, 0);
+                uint64_t hold_max = atomic_exchange(&gpu->window_hold_max_ns, 0);
+                LOG_ERROR_UNPREFIXED(
+                    "webview drops: %" PRIu64 " burst, %" PRIu64 " stuck (oldest held %.1f ms); %" PRIu64
+                    " frames <8 ms apart; slot held avg %.1f ms max %.1f ms; %u never shown\n",
+                    gpu->window_drops_burst,
+                    gpu->window_drops_stuck,
+                    (double) gpu->window_drop_oldest_max_ns / 1e6,
+                    gpu->window_fast_arrivals,
+                    releases ? (double) hold / (double) releases / 1e6 : 0.0,
+                    (double) hold_max / 1e6,
+                    dmabuf_surface_take_unshown_count()
+                );
+                gpu->window_drops_burst = gpu->window_drops_stuck = gpu->window_drop_oldest_max_ns = 0;
+                gpu->window_fast_arrivals = 0;
+            }
             gpu->window_start_ns = end_ns;
             gpu->window_frames = gpu->window_dropped = gpu->window_copy_ns = gpu->window_copy_max_ns = 0;
         }
@@ -815,6 +859,15 @@ void webview_gpu_release_dmabuf(struct dmabuf *dmabuf) {
     // The slot owns the fd and the BO. Only mark it free for the next frame.
     slot = dmabuf->userdata;
     dmabuf->userdata = NULL;
+    {
+        uint64_t filled = atomic_exchange(&slot->filled_ns, 0);
+        if (filled != 0) {
+            uint64_t held = now_ns() - filled, max = atomic_load(&slot->gpu->window_hold_max_ns);
+            atomic_fetch_add(&slot->gpu->window_releases, 1);
+            atomic_fetch_add(&slot->gpu->window_hold_ns, held);
+            while (held > max && !atomic_compare_exchange_weak(&slot->gpu->window_hold_max_ns, &max, held)) {}
+        }
+    }
     atomic_store(&slot->busy, false);
     webview_gpu_unref_internal(slot->gpu);
 }

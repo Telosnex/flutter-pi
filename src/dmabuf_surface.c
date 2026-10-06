@@ -37,6 +37,7 @@
 
 #include <errno.h>
 #include <stdatomic.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdlib.h>
 
@@ -59,7 +60,15 @@ struct refcounted_dmabuf {
     uint32_t drm_fb_id;
 };
 
+static atomic_uint n_unshown;
+
+unsigned dmabuf_surface_take_unshown_count(void) {
+    return atomic_exchange(&n_unshown, 0);
+}
+
 void refcounted_dmabuf_destroy(struct refcounted_dmabuf *dmabuf) {
+    // No framebuffer means the buffer was replaced before it was ever shown.
+    if (!DRM_ID_IS_VALID(dmabuf->drm_fb_id)) atomic_fetch_add(&n_unshown, 1);
     dmabuf->release_callback(&dmabuf->buf);
     if (DRM_ID_IS_VALID(dmabuf->drm_fb_id)) {
         drmdev_rm_fb(dmabuf->drmdev, dmabuf->drm_fb_id);

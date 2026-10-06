@@ -40,6 +40,10 @@ struct tracer;
 
 MUST_CHECK struct dmabuf_surface *dmabuf_surface_new(struct tracer *tracer, struct texture_registry *texture_registry);
 
+/// Buffers replaced before ever reaching the screen since the last call
+/// (diagnostics, all surfaces).
+unsigned dmabuf_surface_take_unshown_count(void);
+
 int dmabuf_surface_push_dmabuf(struct dmabuf_surface *s, const struct dmabuf *buf, dmabuf_release_cb_t release_cb);
 
 /// True once the compositor has actually pushed this surface as a KMS layer.
