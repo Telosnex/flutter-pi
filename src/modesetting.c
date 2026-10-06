@@ -12,6 +12,10 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#include <pthread.h>
+#include <stdarg.h>
+#include <sys/time.h>
+#include <time.h>
 #include <sys/epoll.h>
 #include <sys/ioctl.h>
 #include <xf86drm.h>
@@ -632,6 +636,39 @@ extern struct _drmModeFB2 *drmModeGetFB2(int fd, uint32_t bufferId) __attribute_
 extern void drmModeFreeFB2(struct _drmModeFB2 *ptr) __attribute__((weak));
     #define HAVE_WEAK_DRM_MODE_GET_FB2
 #endif
+
+static pthread_mutex_t kms_trace_mutex = PTHREAD_MUTEX_INITIALIZER;
+static FILE *kms_trace_file;
+static int kms_trace_on = -1;
+
+bool kms_trace_enabled(void) {
+    if (kms_trace_on < 0) {
+        pthread_mutex_lock(&kms_trace_mutex);
+        if (kms_trace_on < 0) {
+            if (getenv("FLUTTERPI_KMS_TRACE") != NULL) kms_trace_file = fopen("/var/tmp/fpi-kms-trace.log", "w");
+            kms_trace_on = kms_trace_file != NULL;
+        }
+        pthread_mutex_unlock(&kms_trace_mutex);
+    }
+    return kms_trace_on;
+}
+
+void kms_trace(const char *fmt, ...) {
+    struct timeval tv;
+    struct tm tm;
+    va_list args;
+
+    if (!kms_trace_enabled()) return;
+    gettimeofday(&tv, NULL);
+    localtime_r(&tv.tv_sec, &tm);
+    pthread_mutex_lock(&kms_trace_mutex);
+    fprintf(kms_trace_file, "%02d:%02d:%02d.%03ld ", tm.tm_hour, tm.tm_min, tm.tm_sec, (long) (tv.tv_usec / 1000));
+    va_start(args, fmt);
+    vfprintf(kms_trace_file, fmt, args);
+    va_end(args);
+    fflush(kms_trace_file);
+    pthread_mutex_unlock(&kms_trace_mutex);
+}
 
 static int fetch_plane(int drm_fd, uint32_t plane_id, struct drm_plane *plane_out) {
     struct drm_plane_prop_ids ids;
@@ -1465,6 +1502,7 @@ static void drmdev_dispatch_page_flips(struct drmdev *drmdev) {
 
         drmdev_unlock(drmdev);
 
+        kms_trace("flip retired=%p\n", (void *) retired_req);
         if (retired_req != NULL) {
             kms_req_unref(retired_req);
         }
@@ -3091,6 +3129,30 @@ kms_req_commit_common(struct kms_req *req, bool blocking, kms_scanout_cb_t scano
         /// TODO: If we're on raspberry pi and only have one layer, we can do an async pageflip
         /// on the primary plane to replace the next queued frame. (To do _real_ triple buffering
         /// with fully decoupled framerate, potentially)
+        if (kms_trace_enabled()) {
+            char buf[1024];
+            int n = 0;
+            int i;
+            BITSET_FOREACH_SET(i, builder->available_planes, 32) {
+                struct drm_plane *plane = builder->drmdev->planes + i;
+                if (drm_plane_is_active(plane) && plane->committed_state.crtc_id == builder->crtc->id && n < (int) sizeof buf - 40) {
+                    n += snprintf(buf + n, sizeof buf - n, " off:p%u", plane->id);
+                }
+            }
+            for (int j = 0; j < builder->n_layers && n < (int) sizeof buf - 120; j++) {
+                struct kms_req_layer *l = builder->layers + j;
+                n += snprintf(
+                    buf + n, sizeof buf - n,
+                    " [p%u fb%u z%" PRId64 "%s src %d,%d %dx%d dst %d,%d %dx%d %s%s]",
+                    l->plane_id, l->layer.drm_fb_id, l->zpos, l->set_zpos ? "" : "?",
+                    l->layer.src_x >> 16, l->layer.src_y >> 16, l->layer.src_w >> 16, l->layer.src_h >> 16,
+                    l->layer.dst_x, l->layer.dst_y, l->layer.dst_w, l->layer.dst_h,
+                    get_pixfmt_info(l->layer.format)->name,
+                    l->layer.has_in_fence_fd ? " fence" : ""
+                );
+            }
+            kms_trace("commit req=%p%s%s\n", (void *) builder, blocking ? " blocking" : "", buf);
+        }
         ok = drmModeAtomicCommit(builder->drmdev->master_fd, builder->req, flags, kms_req_builder_ref(builder));
         if (ok != 0) {
             ok = errno;

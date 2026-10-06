@@ -44,6 +44,7 @@
 #include <drm_fourcc.h>
 
 #include "compositor_ng.h"
+#include "modesetting.h"
 #include "surface.h"
 #include "surface_private.h"
 #include "texture_registry.h"
@@ -75,6 +76,7 @@ void refcounted_dmabuf_destroy(struct refcounted_dmabuf *dmabuf) {
     if (!DRM_ID_IS_VALID(dmabuf->drm_fb_id)) atomic_fetch_add(&n_unshown, 1);
     // Drop the framebuffer before the producer gets the buffer back: with
     // direct scanout the producer renders into it again.
+    kms_trace("rmfb fb%u userdata=%p\n", dmabuf->drm_fb_id, dmabuf->buf.userdata);
     if (DRM_ID_IS_VALID(dmabuf->drm_fb_id)) {
         drmdev_rm_fb(dmabuf->drmdev, dmabuf->drm_fb_id);
     }
@@ -169,6 +171,7 @@ int dmabuf_surface_init(struct dmabuf_surface *s, struct tracer *tracer, struct 
     s->texture = texture;
     s->next_buf = NULL;
     s->presented_once = false;
+    atomic_init(&s->import_failed, false);
     return 0;
 }
 
@@ -243,6 +246,7 @@ int dmabuf_surface_push_dmabuf(struct dmabuf_surface *s, const struct dmabuf *bu
     b->release_callback = release_cb;
     b->drmdev = NULL;
     b->drm_fb_id = DRM_ID_NONE;
+    b->import_failed = false;
 
     surface_lock(CAST_SURFACE_UNCHECKED(s));
 
@@ -318,6 +322,7 @@ static int dmabuf_surface_present_kms(struct surface *_s, const struct fl_layer_
             s->next_buf->buf.has_modifiers,
             s->next_buf->buf.modifiers[0]
         );
+        kms_trace("surface %p addfb fb%u for userdata=%p\n", (void *) s, fb_id, s->next_buf->buf.userdata);
         if (!DRM_ID_IS_VALID(fb_id)) {
             LOG_ERROR(
                 "Couldn't add dmabuf as framebuffer (%dx%d stride %d modifier 0x%016" PRIx64 ").\n",

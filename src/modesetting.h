@@ -750,6 +750,11 @@ typedef void (*kms_deferred_fb_release_cb_t)(void *userdata, int syncfile_fd);
 
 struct kms_req_builder;
 
+/// Per-frame display trace to /var/tmp/fpi-kms-trace.log, enabled by
+/// FLUTTERPI_KMS_TRACE. Lines carry wall-clock time to match video.
+bool kms_trace_enabled(void);
+void kms_trace(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+
 struct kms_req_builder *drmdev_create_request_builder(struct drmdev *drmdev, uint32_t crtc_id);
 
 DECLARE_REF_OPS(kms_req_builder);

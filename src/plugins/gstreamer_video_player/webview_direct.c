@@ -27,6 +27,7 @@
 
 #include "compositor_ng.h"
 #include "dmabuf_surface.h"
+#include "modesetting.h"
 #include "plugins/gstreamer_video_player/webview_gpu.h"
 #include "util/logging.h"
 
@@ -61,6 +62,9 @@ struct webview_direct {
     bool scanout_logged;
     gint64 stats_start_us;
     guint64 stats_scanout, stats_copied, stats_fence_us, stats_fence_max_us;
+    guint64 stats_no_fence;
+    /// FLUTTERPI_KMS_TRACE: WebKit's buffers, to number them in the trace.
+    WPEBuffer *trace_buffers[8];
     /// The frame WebKit is waiting on: it starts the next one only after
     /// wpe_view_buffer_rendered(), which we send at the next page flip.
     WPEBuffer *waiting_buffer;
@@ -148,6 +152,7 @@ static GMainContext *webkit_context(void);
 
 static gboolean release_scanout_on_thread(void *userdata) {
     struct scanout_hold *hold = userdata;
+    kms_trace("webview released hold=%p to WebKit\n", (void *) hold);
     // WebKit may render into it again now.
     wpe_view_buffer_released(hold->wpe_view, hold->buffer);
     g_object_unref(hold->buffer);
@@ -203,6 +208,14 @@ static bool try_scanout(struct webview_direct *view, WPEBuffer *buffer, WPEBuffe
     if (hold == NULL) return false;
     hold->wpe_view = g_object_ref(view->wpe_view);
     hold->buffer = g_object_ref(buffer);
+    if (kms_trace_enabled()) {
+        int idx = -1;
+        for (int i = 0; i < 8; i++) {
+            if (view->trace_buffers[i] == buffer) { idx = i; break; }
+            if (view->trace_buffers[i] == NULL) { view->trace_buffers[i] = buffer; idx = i; break; }
+        }
+        kms_trace("webview buf#%d -> hold=%p fence=%s\n", idx, (void *) hold, wpe_buffer_get_rendering_fence(buffer) >= 0 ? "yes" : "no");
+    }
 
     ok = dmabuf_surface_push_dmabuf(
         view->surface,
@@ -240,15 +253,18 @@ static void log_frame_stats(struct webview_direct *view, gint64 fence_us) {
     if (now - view->stats_start_us >= 5000000) {
         guint64 n = view->stats_scanout + view->stats_copied;
         LOG_STATS(
-            "%.1f fps: %" PRIu64 " scanned out, %" PRIu64 " copied; fence wait avg %.2f ms max %.2f ms\n",
+            "%.1f fps: %" PRIu64 " scanned out, %" PRIu64 " copied, %" PRIu64 " without fence"
+            "; fence wait avg %.2f ms max %.2f ms\n",
             n * 1e6 / (double) (now - view->stats_start_us),
             view->stats_scanout,
             view->stats_copied,
+            view->stats_no_fence,
             n ? view->stats_fence_us / (double) n / 1000.0 : 0.0,
             view->stats_fence_max_us / 1000.0
         );
         view->stats_start_us = now;
         view->stats_scanout = view->stats_copied = view->stats_fence_us = view->stats_fence_max_us = 0;
+        view->stats_no_fence = 0;
     }
 }
 
@@ -274,6 +290,7 @@ static bool present_frame(struct webview_direct *view, WPEBuffer *buffer) {
     }
     fd = wpe_buffer_dma_buf_get_fd(dmabuf_buffer, 0);
     fence_start = g_get_monotonic_time();
+    if (wpe_buffer_get_rendering_fence(buffer) < 0) view->stats_no_fence++;
     wait_for_fence(wpe_buffer_get_rendering_fence(buffer));
 
     if (view->n_frames++ == 0) {
@@ -508,6 +525,15 @@ static WPEBufferFormats *flutterpi_wpe_display_get_preferred_buffer_formats(WPED
     return formats;
 }
 
+/// Ask WebKit for a fence with each frame. Without one it hands frames over
+/// before its GPU work is done (the fence wait measures ~8 ms), and the
+/// direct scanout path has nothing to wait on.
+/// FLUTTERPI_WEBVIEW_EXPLICIT_SYNC=0 turns it off.
+static gboolean flutterpi_wpe_display_use_explicit_sync(WPEDisplay *display) {
+    (void) display;
+    return g_strcmp0(getenv("FLUTTERPI_WEBVIEW_EXPLICIT_SYNC"), "0") != 0;
+}
+
 static void flutterpi_wpe_display_init(FlutterpiWpeDisplay *self) {
     self->egl_display = EGL_NO_DISPLAY;
 }
@@ -520,6 +546,7 @@ static void flutterpi_wpe_display_class_init(FlutterpiWpeDisplayClass *klass) {
     display_class->get_drm_device = flutterpi_wpe_display_get_drm_device;
     display_class->get_keymap = flutterpi_wpe_display_get_keymap;
     display_class->get_preferred_buffer_formats = flutterpi_wpe_display_get_preferred_buffer_formats;
+    display_class->use_explicit_sync = flutterpi_wpe_display_use_explicit_sync;
 }
 
 /* ------------------------------------------------------------------------- */

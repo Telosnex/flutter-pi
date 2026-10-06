@@ -14,6 +14,7 @@
 #include <stdlib.h>
 
 #include "compositor_ng.h"
+#include "modesetting.h"
 #include "util/collection.h"
 #include "util/lock_ops.h"
 #include "util/logging.h"
@@ -246,6 +247,7 @@ void frame_scheduler_present_frame(struct frame_scheduler *scheduler, void_callb
             displaced_cancel_cb = scheduler->queued_frame.cancel_cb;
             displaced_userdata = scheduler->queued_frame.userdata;
             scheduler->stats.n_displaced++;
+            kms_trace("displaced queued frame\n");
         }
 
         scheduler->has_queued_frame = true;

@@ -1370,6 +1370,7 @@ static int kms_window_push_composition(struct window *window, struct fl_layer_co
 
     window_lock(window);
 
+    kms_trace("push flutter layers=%zu\n", fl_layer_composition_get_n_layers(composition));
     ok = kms_window_push_composition_locked(window, composition);
 
     window_unlock(window);
@@ -1399,6 +1400,7 @@ int window_request_repaint(struct window *window, void_callback_t on_scanout, vo
     // Re-commit Flutter's last frame: layers are re-read, so plane surfaces
     // show their newest buffer even when Flutter has nothing new to draw.
     // A newer Flutter frame still displaces this one (mailbox semantics).
+    kms_trace("push repaint\n");
     ok = kms_window_push_composition_locked(window, window->composition);
     window_unlock(window);
 
