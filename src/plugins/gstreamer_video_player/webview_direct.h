@@ -20,6 +20,8 @@
 #include <glib-object.h>
 #include <gst/gst.h>
 
+struct compositor;
+
 struct webview_gpu;
 struct dmabuf_surface;
 struct webview_direct;
@@ -38,6 +40,7 @@ bool webview_direct_parse_pipeline(const char *description, char **location_out,
 struct webview_direct *webview_direct_new(
     struct webview_gpu *gpu,
     struct dmabuf_surface *surface,
+    struct compositor *compositor,
     int width,
     int height,
     const char *location,

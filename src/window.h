@@ -123,6 +123,15 @@ MUST_CHECK struct window *dummy_window_new(
 int window_push_composition(struct window *window, struct fl_layer_composition *composition);
 
 /**
+ * @brief Re-commits the last composition so platform-view planes show their
+ * newest buffer without Flutter drawing a frame. Any thread.
+ *
+ * @param on_scanout Optional; called once at the next page flip.
+ * @returns 0, ENOTSUP (no KMS), EAGAIN (nothing composited yet), EBUSY.
+ */
+int window_request_repaint(struct window *window, void_callback_t on_scanout, void *userdata);
+
+/**
  * @brief Get the current view geometry of this window.
  *
  * @param window The window instance.

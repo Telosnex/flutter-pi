@@ -1377,6 +1377,37 @@ static int kms_window_push_composition(struct window *window, struct fl_layer_co
     return ok;
 }
 
+int window_request_repaint(struct window *window, void_callback_t on_scanout, void *userdata) {
+    int ok;
+
+    ASSERT_NOT_NULL(window);
+
+    // Only the KMS window shows platform-view planes.
+    if (window->push_composition != kms_window_push_composition) {
+        return ENOTSUP;
+    }
+
+    window_lock(window);
+    if (window->composition == NULL) {
+        window_unlock(window);
+        return EAGAIN;
+    }
+    if (on_scanout != NULL && !frame_scheduler_on_next_scanout(window->frame_scheduler, on_scanout, userdata)) {
+        window_unlock(window);
+        return EBUSY;
+    }
+    // Re-commit Flutter's last frame: layers are re-read, so plane surfaces
+    // show their newest buffer even when Flutter has nothing new to draw.
+    // A newer Flutter frame still displaces this one (mailbox semantics).
+    ok = kms_window_push_composition_locked(window, window->composition);
+    window_unlock(window);
+
+    // If the push failed before reaching the scheduler, the listener still
+    // fires at the next flip of some other commit, or never if the display
+    // is idle; callers keep a timeout for that.
+    return ok;
+}
+
 static bool count_modifiers_for_pixel_format(
     UNUSED struct drm_plane *plane,
     UNUSED int index,

@@ -86,6 +86,13 @@ struct frame_scheduler {
     /// The pending flutter vsync request baton, if any. 0 means none.
     intptr_t pending_vsync_baton;
 
+    /// One-shot callbacks for the next page flip (or failed commit).
+    size_t n_scanout_listeners;
+    struct {
+        void_callback_t cb;
+        void *userdata;
+    } scanout_listeners[FRAME_SCHEDULER_MAX_SCANOUT_LISTENERS];
+
     struct {
         /// 0 if disabled, otherwise the reporting interval in nanoseconds.
         uint64_t report_interval_ns;
@@ -265,6 +272,42 @@ void frame_scheduler_present_frame(struct frame_scheduler *scheduler, void_callb
     }
 }
 
+bool frame_scheduler_on_next_scanout(struct frame_scheduler *scheduler, void_callback_t cb, void *userdata) {
+    bool ok;
+
+    ASSERT_NOT_NULL(scheduler);
+    ASSERT_NOT_NULL(cb);
+
+    frame_scheduler_lock(scheduler);
+    ok = scheduler->n_scanout_listeners < FRAME_SCHEDULER_MAX_SCANOUT_LISTENERS;
+    if (ok) {
+        scheduler->scanout_listeners[scheduler->n_scanout_listeners].cb = cb;
+        scheduler->scanout_listeners[scheduler->n_scanout_listeners].userdata = userdata;
+        scheduler->n_scanout_listeners++;
+    }
+    frame_scheduler_unlock(scheduler);
+    return ok;
+}
+
+/// Takes the listeners out under the lock and calls them without it.
+static void frame_scheduler_fire_scanout_listeners(struct frame_scheduler *scheduler) {
+    size_t n;
+    struct {
+        void_callback_t cb;
+        void *userdata;
+    } listeners[FRAME_SCHEDULER_MAX_SCANOUT_LISTENERS];
+
+    frame_scheduler_lock(scheduler);
+    n = scheduler->n_scanout_listeners;
+    memcpy(listeners, scheduler->scanout_listeners, n * sizeof listeners[0]);
+    scheduler->n_scanout_listeners = 0;
+    frame_scheduler_unlock(scheduler);
+
+    for (size_t i = 0; i < n; i++) {
+        listeners[i].cb(listeners[i].userdata);
+    }
+}
+
 void frame_scheduler_on_present_failed(struct frame_scheduler *scheduler) {
     void_callback_t queued_cancel_cb;
     void *queued_userdata;
@@ -299,6 +342,9 @@ void frame_scheduler_on_present_failed(struct frame_scheduler *scheduler) {
     if (queued_cancel_cb != NULL) {
         queued_cancel_cb(queued_userdata);
     }
+
+    // No flip is coming; don't leave anyone waiting for one.
+    frame_scheduler_fire_scanout_listeners(scheduler);
 
     if (pending_baton != 0) {
         uint64_t now = get_monotonic_time();
@@ -410,6 +456,7 @@ void frame_scheduler_on_scanout(struct frame_scheduler *scheduler, bool has_time
         // was reset by frame_scheduler_on_present_failed after the commit was
         // actually submitted. Ignore.
         frame_scheduler_unlock(scheduler);
+        frame_scheduler_fire_scanout_listeners(scheduler);
         return;
     }
 
@@ -452,4 +499,6 @@ void frame_scheduler_on_scanout(struct frame_scheduler *scheduler, bool has_time
     if (present_cb != NULL) {
         present_cb(present_userdata);
     }
+
+    frame_scheduler_fire_scanout_listeners(scheduler);
 }

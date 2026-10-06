@@ -433,6 +433,11 @@ ATTR_PURE static bool platform_view_with_id_equal(const struct platform_view_wit
     return lhs.id == rhs.id;
 }
 
+int compositor_request_repaint(struct compositor *compositor, void_callback_t on_scanout, void *userdata) {
+    ASSERT_NOT_NULL(compositor);
+    return window_request_repaint(compositor->main_window, on_scanout, userdata);
+}
+
 int compositor_set_platform_view(struct compositor *compositor, int64_t id, struct surface *surface) {
     struct platform_view_with_id *view;
 

@@ -1294,6 +1294,7 @@ static int init_direct(struct gstplayer *player) {
     player->webview_direct = webview_direct_new(
         player->webview_gpu,
         player->dmabuf_surface,
+        flutterpi_get_compositor(player->flutterpi),
         width,
         height,
         location,

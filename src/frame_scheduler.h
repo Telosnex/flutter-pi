@@ -80,6 +80,16 @@ void frame_scheduler_set_frame_interval(struct frame_scheduler *scheduler, uint6
  */
 void frame_scheduler_on_present_failed(struct frame_scheduler *scheduler);
 
+#define FRAME_SCHEDULER_MAX_SCANOUT_LISTENERS 16
+
+/**
+ * @brief Calls @p cb once, at the next page flip (after any queued frame has
+ * been committed), or when a commit fails. Any thread.
+ *
+ * @returns false if too many listeners are waiting; @p cb is then not called.
+ */
+bool frame_scheduler_on_next_scanout(struct frame_scheduler *scheduler, void_callback_t cb, void *userdata);
+
 /**
  * @brief Called when flutter calls the embedder supplied vsync_callback.
  * Embedder should reply on the platform task thread with the timestamp

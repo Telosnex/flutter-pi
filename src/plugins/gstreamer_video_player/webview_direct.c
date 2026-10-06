@@ -23,6 +23,7 @@
 #include <wpe/wpe-platform.h>
 #include <xkbcommon/xkbcommon.h>
 
+#include "compositor_ng.h"
 #include "dmabuf_surface.h"
 #include "plugins/gstreamer_video_player/webview_gpu.h"
 #include "util/logging.h"
@@ -42,6 +43,7 @@ struct webview_direct {
     // Set at creation, read-only afterwards.
     struct webview_gpu *gpu;
     struct dmabuf_surface *surface;
+    struct compositor *compositor;
     int width, height;
     webview_direct_configure_cb configure;
     void *userdata;
@@ -51,6 +53,10 @@ struct webview_direct {
     WPEView *wpe_view;
     gint64 created_us, first_frame_us;
     guint64 n_frames, n_copy_failures, n_not_dmabuf;
+    /// The frame WebKit is waiting on: it starts the next one only after
+    /// wpe_view_buffer_rendered(), which we send at the next page flip.
+    WPEBuffer *waiting_buffer;
+    GSource *waiting_timeout;
 
     // Latest coalesced pointer move, guarded by move_lock.
     GMutex move_lock;
@@ -157,6 +163,49 @@ static void present_frame(struct webview_direct *view, WPEBuffer *buffer) {
     }
 }
 
+/// Hands the waiting frame back to WebKit, letting it start the next one.
+/// WebKit thread.
+static void finish_waiting_frame(struct webview_direct *view) {
+    WPEBuffer *buffer = view->waiting_buffer;
+    if (view->waiting_timeout != NULL) {
+        g_source_destroy(view->waiting_timeout);
+        g_source_unref(view->waiting_timeout);
+        view->waiting_timeout = NULL;
+    }
+    if (buffer == NULL) return;
+    view->waiting_buffer = NULL;
+    if (view->wpe_view != NULL) {
+        wpe_view_buffer_rendered(view->wpe_view, buffer);
+        wpe_view_buffer_released(view->wpe_view, buffer);
+    }
+    g_object_unref(buffer);
+}
+
+static gboolean finish_on_thread(void *userdata) {
+    finish_waiting_frame(userdata);
+    return G_SOURCE_REMOVE;
+}
+
+static void destroy_view_ref(void *userdata) {
+    view_unref(userdata);
+}
+
+static GMainContext *webkit_context(void);
+
+/// Display thread, at the page flip after the frame was committed.
+static void on_frame_scanout(void *userdata) {
+    g_main_context_invoke_full(webkit_context(), G_PRIORITY_HIGH, finish_on_thread, userdata, destroy_view_ref);
+}
+
+/// Safety net if no flip comes (display off, commit failed early).
+static gboolean on_frame_timeout(void *userdata) {
+    struct webview_direct *view = userdata;
+    // finish_waiting_frame destroys the source; this callback returning
+    // REMOVE afterwards is fine.
+    finish_waiting_frame(view);
+    return G_SOURCE_REMOVE;
+}
+
 static gboolean flutterpi_wpe_view_render_buffer(
     WPEView *wpe_view,
     WPEBuffer *buffer,
@@ -169,14 +218,33 @@ static gboolean flutterpi_wpe_view_render_buffer(
     (void) n_damage_rects;
     (void) error;
 
-    if (view != NULL) {
-        present_frame(view, buffer);
+    if (view == NULL) {
+        // Closing: hand the buffer straight back.
+        wpe_view_buffer_rendered(wpe_view, buffer);
+        wpe_view_buffer_released(wpe_view, buffer);
+        return TRUE;
     }
-    // The copy has finished reading the buffer (webview_gpu waits for the GPU),
-    // so WebKit gets it back before this function returns. Nothing outside
-    // this thread ever holds a WebKit buffer.
-    wpe_view_buffer_rendered(wpe_view, buffer);
-    wpe_view_buffer_released(wpe_view, buffer);
+
+    // WebKit should not send a frame before the previous one is finished;
+    // if it does, finish the old one first.
+    finish_waiting_frame(view);
+    present_frame(view, buffer);
+
+    // The copy has finished reading the buffer (webview_gpu waits for the
+    // GPU), but WebKit only gets it back at the next page flip, which paces
+    // WebKit to the display instead of letting it draw hundreds of frames a
+    // second that are never shown. The repaint also puts the frame on screen
+    // when Flutter itself is idle. Only this thread holds WebKit buffers.
+    view->waiting_buffer = g_object_ref(buffer);
+    if (compositor_request_repaint(view->compositor, on_frame_scanout, view_ref(view)) != 0) {
+        // No listener was registered (nothing composited yet, or no KMS).
+        view_unref(view);
+        finish_waiting_frame(view);
+        return TRUE;
+    }
+    view->waiting_timeout = g_timeout_source_new(100);
+    g_source_set_callback(view->waiting_timeout, on_frame_timeout, view, NULL);
+    g_source_attach(view->waiting_timeout, webkit_context());
     return TRUE;
 }
 
@@ -334,6 +402,10 @@ static void *run_webkit_thread(void *userdata) {
     return NULL;
 }
 
+static GMainContext *webkit_context(void) {
+    return shared.context;
+}
+
 static bool ensure_thread(void) {
     bool ok;
     g_mutex_lock(&shared.lock);
@@ -438,6 +510,7 @@ static gboolean create_on_thread(void *userdata) {
 struct webview_direct *webview_direct_new(
     struct webview_gpu *gpu,
     struct dmabuf_surface *surface,
+    struct compositor *compositor,
     int width,
     int height,
     const char *location,
@@ -446,7 +519,7 @@ struct webview_direct *webview_direct_new(
 ) {
     struct webview_direct *view;
 
-    if (gpu == NULL || surface == NULL || width <= 0 || height <= 0) {
+    if (gpu == NULL || surface == NULL || compositor == NULL || width <= 0 || height <= 0) {
         LOG_ERROR("webview direct: needs the GPU frame path, a plane surface, and a size.\n");
         return NULL;
     }
@@ -460,6 +533,7 @@ struct webview_direct *webview_direct_new(
     g_mutex_init(&view->move_lock);
     view->gpu = gpu;
     view->surface = surface;
+    view->compositor = compositor;
     view->width = width;
     view->height = height;
     view->configure = configure;
@@ -483,6 +557,7 @@ static gboolean destroy_on_thread(void *userdata) {
 
     // After this, render_buffer still returns buffers to WebKit but no longer
     // touches the surface, and no signal reaches the owner's userdata.
+    finish_waiting_frame(view);
     ((FlutterpiWpeView *) view->wpe_view)->owner = NULL;
     manager = webkit_web_view_get_user_content_manager(web_view);
     if (view->userdata != NULL) {
