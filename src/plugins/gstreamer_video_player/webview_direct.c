@@ -386,6 +386,12 @@ static void *run_webkit_thread(void *userdata) {
     g_mutex_lock(&shared.lock);
     shared.display = display;
     shared.web_context = display != NULL ? WEBKIT_WEB_CONTEXT(g_object_new(WEBKIT_TYPE_WEB_CONTEXT, NULL)) : NULL;
+    if (shared.web_context != NULL) {
+        // No web process cache or back/forward page cache: a closed webview's
+        // web process exits instead of idling at ~100 MB for reuse. Costs a
+        // slower reopen and slower Back navigation.
+        webkit_web_context_set_cache_model(shared.web_context, WEBKIT_CACHE_MODEL_DOCUMENT_VIEWER);
+    }
     shared.ready = true;
     g_cond_broadcast(&shared.cond);
     g_mutex_unlock(&shared.lock);
