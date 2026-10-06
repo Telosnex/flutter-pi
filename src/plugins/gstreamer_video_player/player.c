@@ -1301,12 +1301,6 @@ static int init(struct gstplayer *player, bool force_sw_decoders) {
 
     gst_pad_add_probe(pad, GST_PAD_PROBE_TYPE_QUERY_DOWNSTREAM, on_query_appsink, player, NULL);
 
-    if (player->webview_gpu != NULL) {
-        // We own scanout copies, so retaining an additional WebKit image has
-        // no benefit and can outlive the backend during source shutdown.
-        g_object_set(sink, "enable-last-sample", FALSE, NULL);
-    }
-
     src = gst_bin_get_by_name(GST_BIN(pipeline), "src");
     websrc = gst_bin_get_by_name(GST_BIN(pipeline), "websrc");
     if (websrc != NULL) {
@@ -1455,26 +1449,6 @@ static void maybe_deinit(struct gstplayer *player) {
     }
     if (player->busfd_events != NULL) {
         sd_event_source_unrefp(&player->busfd_events);
-    }
-    if (player->pipeline != NULL && player->sink != NULL && player->webview_gpu != NULL) {
-        // Stop live production without destroying WPE (PAUSED -> READY does
-        // that). Release images held by appsink while the backend still lives.
-        gst_element_set_state(player->pipeline, GST_STATE_PAUSED);
-        GstStateChangeReturn state = gst_element_get_state(player->pipeline, NULL, NULL, 5 * GST_SECOND);
-        if (state == GST_STATE_CHANGE_FAILURE || state == GST_STATE_CHANGE_ASYNC) {
-            LOG_ERROR("webview GPU: could not quiesce pipeline before close.\n");
-        }
-        GstSample *sample = gst_app_sink_try_pull_preroll(GST_APP_SINK(player->sink), 0);
-        if (sample != NULL) {
-            webview_gpu_release_sample(sample);
-            gst_sample_unref(sample);
-        }
-        while ((sample = gst_app_sink_try_pull_sample(GST_APP_SINK(player->sink), 0)) != NULL) {
-            webview_gpu_release_sample(sample);
-            gst_sample_unref(sample);
-        }
-        // Flush the sink before WPE's source stop destroys its backend.
-        gst_element_set_state(GST_ELEMENT(player->sink), GST_STATE_READY);
     }
     if (player->sink != NULL) {
         gst_object_unref(GST_OBJECT(player->sink));
