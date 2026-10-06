@@ -1789,6 +1789,10 @@ int64_t gstplayer_get_texture_id(struct gstplayer *player) {
     return player->texture_id;
 }
 
+bool gstplayer_supports_pixel_scroll(struct gstplayer *player) {
+    return player->webview_direct != NULL;
+}
+
 int64_t gstplayer_get_platform_view_id(struct gstplayer *player) {
     ASSERT_NOT_NULL(player);
     return player->platform_view_id;

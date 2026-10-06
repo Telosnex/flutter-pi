@@ -122,6 +122,8 @@ void *gstplayer_get_userdata_locked(struct gstplayer *player);
 
 /// Get the id of the flutter external texture that this player is rendering into.
 int64_t gstplayer_get_texture_id(struct gstplayer *player);
+bool gstplayer_supports_pixel_scroll(struct gstplayer *player);
+
 int64_t gstplayer_get_platform_view_id(struct gstplayer *player);
 
 //void gstplayer_set_info_callback(struct gstplayer *player, gstplayer_info_callback_t cb, void *userdata);

@@ -1362,11 +1362,13 @@ invalid_headers:
     if (getenv("FLUTTERPI_WEBVIEW_ON_PLANE") != NULL) {
         return platch_respond_success_std(
             responsehandle,
-            &STDMAP2(
+            &STDMAP3(
                 STDSTRING("textureId"),
                 STDINT64(gstplayer_get_texture_id(player)),
                 STDSTRING("platformViewId"),
-                STDINT64(gstplayer_get_platform_view_id(player))
+                STDINT64(gstplayer_get_platform_view_id(player)),
+                STDSTRING("pixelScroll"),
+                STDBOOL(gstplayer_supports_pixel_scroll(player))
             )
         );
     }
