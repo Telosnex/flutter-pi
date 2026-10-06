@@ -13,6 +13,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -102,7 +103,19 @@ struct webview_gpu {
     uint64_t use_counter;
 
     uint64_t n_frames, n_dropped, n_imports;
+
+    /// Copy timing, for comparing frame paths (FLUTTERPI_WEBVIEW_STATS=1 logs
+    /// a line every 5 s; a summary is always logged on destroy).
+    bool log_stats;
+    uint64_t copy_ns_total, copy_ns_max;
+    uint64_t window_start_ns, window_frames, window_dropped, window_copy_ns, window_copy_max_ns;
 };
+
+static uint64_t now_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t) ts.tv_sec * 1000000000ull + (uint64_t) ts.tv_nsec;
+}
 
 static void webview_gpu_destroy(struct webview_gpu *gpu);
 
@@ -155,6 +168,7 @@ struct webview_gpu *webview_gpu_new(struct gbm_device *gbm_device) {
     if (gpu == NULL) {
         return NULL;
     }
+    gpu->log_stats = getenv("FLUTTERPI_WEBVIEW_STATS") != NULL;
 
     // For the same gbm_device this returns flutter-pi's own EGLDisplay when the
     // GL renderer is active. Initializing it again is a no-op, and this module
@@ -277,10 +291,12 @@ static void webview_gpu_destroy(struct webview_gpu *gpu) {
     eglDestroyContext(gpu->display, gpu->context);
     pthread_mutex_destroy(&gpu->lock);
     LOG_ERROR_UNPREFIXED(
-        "webview GPU frames: destroyed after %" PRIu64 " frames, %" PRIu64 " dropped, %" PRIu64 " source imports.\n",
+        "webview GPU frames: destroyed after %" PRIu64 " frames, %" PRIu64 " dropped, %" PRIu64 " source imports, copy avg %.2f ms max %.2f ms.\n",
         gpu->n_frames,
         gpu->n_dropped,
-        gpu->n_imports
+        gpu->n_imports,
+        gpu->n_frames ? (double) gpu->copy_ns_total / (double) gpu->n_frames / 1e6 : 0.0,
+        (double) gpu->copy_ns_max / 1e6
     );
     free(gpu);
 }
@@ -537,15 +553,16 @@ static bool ensure_slot(struct webview_gpu *gpu, struct slot *slot, int width, i
 /// Returns a texture for the source frame. Same-display EGLImages bind
 /// directly. Otherwise the image is exported and imported again, cached per
 /// WebKit buffer, since WebKit reuses a few buffers.
+static GLuint dmabuf_texture(struct webview_gpu *gpu, const struct webview_gpu_source *src);
+
 static GLuint source_texture(struct webview_gpu *gpu, GstEGLImage *gst_image, int width, int height) {
     GstGLContext *gl_context = gst_image->context;
     EGLDisplay source_display = EGL_NO_DISPLAY;
-    struct source_entry *entry = NULL, *victim = NULL;
     void *image = gst_egl_image_get_image(gst_image);
     int fourcc = 0, n_planes = 0, fd = -1;
     uint64_t modifier = DRM_FORMAT_MOD_INVALID;
     EGLint stride = 0, offset = 0;
-    struct stat st;
+    GLuint texture;
 
     if (gl_context != NULL) {
         GstGLDisplayEGL *egl = gst_gl_display_egl_from_gl_display(gl_context->display);
@@ -565,8 +582,33 @@ static GLuint source_texture(struct webview_gpu *gpu, GstEGLImage *gst_image, in
         return 0;
     }
 
+    texture = dmabuf_texture(
+        gpu,
+        &(struct webview_gpu_source){
+            .width = width,
+            .height = height,
+            .fourcc = (uint32_t) fourcc,
+            .fd = fd,
+            .stride = (uint32_t) stride,
+            .offset = (uint32_t) offset,
+            .modifier = modifier,
+        }
+    );
+    close(fd);
+    return texture;
+}
+
+/// Imports a single-plane DMA-BUF as a texture, cached by the buffer's inode.
+/// Does not take ownership of @src->fd.
+static GLuint dmabuf_texture(struct webview_gpu *gpu, const struct webview_gpu_source *src) {
+    struct source_entry *entry = NULL, *victim = NULL;
+    int width = src->width, height = src->height, fd = src->fd;
+    uint32_t fourcc = src->fourcc;
+    uint64_t modifier = src->modifier;
+    EGLint stride = (EGLint) src->stride;
+    struct stat st;
+
     if (fstat(fd, &st) != 0) {
-        close(fd);
         return 0;
     }
     for (int i = 0; i < N_SOURCE_CACHE; i++) {
@@ -582,10 +624,9 @@ static GLuint source_texture(struct webview_gpu *gpu, GstEGLImage *gst_image, in
 
     if (entry == NULL) {
         release_source_gl(gpu, victim);
-        victim->image = import_dmabuf(gpu, width, height, (uint32_t) fourcc, fd, (uint32_t) stride, (uint32_t) offset, modifier);
+        victim->image = import_dmabuf(gpu, width, height, fourcc, fd, src->stride, src->offset, modifier);
         if (victim->image == WG_EGL_NO_IMAGE) {
             LOG_ERROR("webview GPU frames: could not import the WebKit frame (0x%x).\n", eglGetError());
-            close(fd);
             memset(victim, 0, sizeof *victim);
             return 0;
         }
@@ -612,23 +653,26 @@ static GLuint source_texture(struct webview_gpu *gpu, GstEGLImage *gst_image, in
             );
         }
     }
-    close(fd);
     entry->last_use = ++gpu->use_counter;
     return entry->texture;
 }
 
-int webview_gpu_copy_sample(struct webview_gpu *gpu, GstSample *sample, struct dmabuf *dmabuf_out) {
-    GstEGLImage *gst_image = sample_image(sample, NULL);
+static int copy_common(
+    struct webview_gpu *gpu,
+    int width,
+    int height,
+    GstEGLImage *gst_image,
+    const struct webview_gpu_source *src,
+    struct dmabuf *dmabuf_out
+) {
     struct slot *slot = NULL;
-    GstVideoInfo info;
     GLuint texture;
-    int width, height, ok = 0;
-
-    if (gst_image == NULL || !gst_video_info_from_caps(&info, gst_sample_get_caps(sample))) {
-        return EINVAL;
-    }
-    width = GST_VIDEO_INFO_WIDTH(&info);
-    height = GST_VIDEO_INFO_HEIGHT(&info);
+    int ok = 0;
+    // The direct path copies on WebKit's thread; keep whatever it had current.
+    EGLDisplay saved_display = eglGetCurrentDisplay();
+    EGLContext saved_context = eglGetCurrentContext();
+    EGLSurface saved_draw = eglGetCurrentSurface(EGL_DRAW);
+    EGLSurface saved_read = eglGetCurrentSurface(EGL_READ);
 
     for (int i = 0; i < N_SLOTS; i++) {
         bool expected = false;
@@ -639,10 +683,12 @@ int webview_gpu_copy_sample(struct webview_gpu *gpu, GstSample *sample, struct d
     }
     if (slot == NULL) {
         gpu->n_dropped++;
+        gpu->window_dropped++;
         return EAGAIN;
     }
 
     pthread_mutex_lock(&gpu->lock);
+    uint64_t copy_start_ns = now_ns();
     if (!eglMakeCurrent(gpu->display, EGL_NO_SURFACE, EGL_NO_SURFACE, gpu->context)) {
         LOG_ERROR("webview GPU frames: eglMakeCurrent failed (0x%x).\n", eglGetError());
         ok = EIO;
@@ -652,7 +698,7 @@ int webview_gpu_copy_sample(struct webview_gpu *gpu, GstSample *sample, struct d
         ok = EIO;
         goto out_release;
     }
-    texture = source_texture(gpu, gst_image, width, height);
+    texture = gst_image != NULL ? source_texture(gpu, gst_image, width, height) : dmabuf_texture(gpu, src);
     if (texture == 0) {
         ok = EIO;
         goto out_release;
@@ -686,17 +732,65 @@ int webview_gpu_copy_sample(struct webview_gpu *gpu, GstSample *sample, struct d
     dmabuf_out->userdata = slot;
     webview_gpu_ref(gpu);
     gpu->n_frames++;
+    {
+        uint64_t end_ns = now_ns(), took = end_ns - copy_start_ns;
+        gpu->copy_ns_total += took;
+        if (took > gpu->copy_ns_max) gpu->copy_ns_max = took;
+        if (gpu->window_start_ns == 0) gpu->window_start_ns = end_ns;
+        gpu->window_frames++;
+        gpu->window_copy_ns += took;
+        if (took > gpu->window_copy_max_ns) gpu->window_copy_max_ns = took;
+        if (gpu->log_stats && end_ns - gpu->window_start_ns >= 5000000000ull) {
+            double seconds = (double) (end_ns - gpu->window_start_ns) / 1e9;
+            LOG_ERROR_UNPREFIXED(
+                "webview GPU frames: %.1f fps, copy avg %.2f ms max %.2f ms, %" PRIu64 " dropped (%dx%d)\n",
+                (double) gpu->window_frames / seconds,
+                (double) gpu->window_copy_ns / (double) gpu->window_frames / 1e6,
+                (double) gpu->window_copy_max_ns / 1e6,
+                gpu->window_dropped,
+                width,
+                height
+            );
+            gpu->window_start_ns = end_ns;
+            gpu->window_frames = gpu->window_dropped = gpu->window_copy_ns = gpu->window_copy_max_ns = 0;
+        }
+    }
 
-    eglMakeCurrent(gpu->display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+    if (saved_context != EGL_NO_CONTEXT) {
+        eglMakeCurrent(saved_display, saved_draw, saved_read, saved_context);
+    } else {
+        eglMakeCurrent(gpu->display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+    }
     pthread_mutex_unlock(&gpu->lock);
     return 0;
 
 out_release:
-    eglMakeCurrent(gpu->display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+    if (saved_context != EGL_NO_CONTEXT) {
+        eglMakeCurrent(saved_display, saved_draw, saved_read, saved_context);
+    } else {
+        eglMakeCurrent(gpu->display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+    }
 out_unlock:
     pthread_mutex_unlock(&gpu->lock);
     atomic_store(&slot->busy, false);
     return ok;
+}
+
+int webview_gpu_copy_sample(struct webview_gpu *gpu, GstSample *sample, struct dmabuf *dmabuf_out) {
+    GstEGLImage *gst_image = sample_image(sample, NULL);
+    GstVideoInfo info;
+
+    if (gst_image == NULL || !gst_video_info_from_caps(&info, gst_sample_get_caps(sample))) {
+        return EINVAL;
+    }
+    return copy_common(gpu, GST_VIDEO_INFO_WIDTH(&info), GST_VIDEO_INFO_HEIGHT(&info), gst_image, NULL, dmabuf_out);
+}
+
+int webview_gpu_copy_dmabuf(struct webview_gpu *gpu, const struct webview_gpu_source *src, struct dmabuf *dmabuf_out) {
+    if (src == NULL || src->fd < 0 || src->width <= 0 || src->height <= 0) {
+        return EINVAL;
+    }
+    return copy_common(gpu, src->width, src->height, NULL, src, dmabuf_out);
 }
 
 void webview_gpu_release_sample(GstSample *sample) {

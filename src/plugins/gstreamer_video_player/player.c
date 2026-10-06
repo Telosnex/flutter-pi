@@ -26,6 +26,7 @@
 #include "platformchannel.h"
 #include "pluginregistry.h"
 #include "plugins/gstreamer_video_player.h"
+#include "plugins/gstreamer_video_player/webview_direct.h"
 #include "plugins/gstreamer_video_player/webview_gpu.h"
 #include "texture_registry.h"
 #include "util/collection.h"
@@ -192,6 +193,11 @@ struct gstplayer {
     /// and frames are copied GPU to GPU into scanout buffers. NULL otherwise.
     struct webview_gpu *webview_gpu;
 
+    /// Set when FLUTTERPI_WEBVIEW_DIRECT is also set and the description is a
+    /// wpevideosrc webview: WebKit runs on WPEPlatform with no pipeline, and
+    /// player->pipeline stays NULL.
+    struct webview_direct *webview_direct;
+
     struct frame_interface *frame_interface;
 
     GstElement *pipeline, *sink, *websrc;
@@ -206,6 +212,9 @@ struct gstplayer {
     sd_event_source *busfd_events;
 
     bool is_live;
+
+    /// True while webview_direct_new() runs, so on_configure_web_view knows.
+    bool creating_direct;
 };
 
 struct pending_web_reply {
@@ -460,7 +469,7 @@ static void on_configure_web_view(GstElement *websrc, GObject *object, void *use
         return;
     }
 
-    if (player->webview_gpu != NULL) {
+    if (player->webview_gpu != NULL && player->webview_direct == NULL && !player->creating_direct) {
         webview_gpu_configure_web_view(object);
     }
 
@@ -680,6 +689,10 @@ static int apply_playback_state(struct gstplayer *player) {
     GstState desired_state, current_state, pending_state;
     double desired_rate;
     int64_t position;
+
+    if (player->pipeline == NULL && player->webview_direct != NULL) {
+        return 0;
+    }
 
     desired_state = player->playpause_state == kPlaying ? GST_STATE_PLAYING : GST_STATE_PAUSED; /* use GST_STATE_PAUSED if we're stepping */
 
@@ -1260,6 +1273,56 @@ void on_source_setup(GstElement *bin, GstElement *source, gpointer userdata) {
     }
 }
 
+static void on_configure_direct_web_view(GObject *web_view, void *userdata) {
+    on_configure_web_view(NULL, web_view, userdata);
+}
+
+/// FLUTTERPI_WEBVIEW_DIRECT: run a wpevideosrc description on WPEPlatform.
+/// Returns ENOTSUP when this description or setup does not qualify.
+static int init_direct(struct gstplayer *player) {
+    char *location = NULL;
+    int width, height;
+
+    if (!webview_direct_requested() || player->webview_gpu == NULL || player->dmabuf_surface == NULL ||
+        !webview_direct_parse_pipeline(player->pipeline_description, &location, &width, &height)) {
+        return ENOTSUP;
+    }
+
+    player->creating_direct = true;
+    player->webview_direct = webview_direct_new(
+        player->webview_gpu,
+        player->dmabuf_surface,
+        width,
+        height,
+        location,
+        on_configure_direct_web_view,
+        player
+    );
+    player->creating_direct = false;
+    g_free(location);
+    if (player->webview_direct == NULL) {
+        // No fallback to wpevideosrc: WebKit may already be running on the
+        // direct path's thread, and it must not start on a second one.
+        LOG_ERROR("Could not create the direct WPE webview.\n");
+        return EIO;
+    }
+
+    // No pipeline reports these, so report them here. The Dart side waits for
+    // "initialized" before it shows the view.
+    player->is_live = true;
+    player->info.info.width = width;
+    player->info.info.height = height;
+    player->info.info.fps = 60;
+    player->info.info.duration_ms = INT64_MAX;
+    player->info.info.can_seek = false;
+    player->info.info.seek_begin_ms = 0;
+    player->info.info.seek_end_ms = 0;
+    player->info.has_resolution = player->info.has_fps = player->info.has_duration = player->info.has_seeking_info = true;
+    maybe_send_info(player);
+    LOG_DEBUG("Created direct WPE webview %dx%d.\n", width, height);
+    return 0;
+}
+
 static int init(struct gstplayer *player, bool force_sw_decoders) {
     GstStateChangeReturn state_change_return;
     sd_event_source *busfd_event_source;
@@ -1271,6 +1334,11 @@ static int init(struct gstplayer *player, bool force_sw_decoders) {
     int ok;
 
     static const char *default_pipeline_descr = "uridecodebin name=\"src\" ! video/x-raw ! appsink sync=true name=\"sink\"";
+
+    if (player->pipeline_description != NULL) {
+        ok = init_direct(player);
+        if (ok != ENOTSUP) return ok;
+    }
 
     const char *pipeline_descr;
     if (player->pipeline_description != NULL) {
@@ -1440,6 +1508,12 @@ fail_unref_pipeline:
 }
 
 static void maybe_deinit(struct gstplayer *player) {
+    if (player->webview_direct != NULL) {
+        // Blocks until WebKit has dropped the view; no callback reaches the
+        // player after this.
+        webview_direct_destroy(player->webview_direct);
+        player->webview_direct = NULL;
+    }
     if (player->web_thread != NULL) {
         struct web_task *stop = g_new0(struct web_task, 1);
         stop->type = kWebTaskStop;
@@ -1586,6 +1660,8 @@ static struct gstplayer *gstplayer_new(struct flutterpi *flutterpi, const char *
     player->platform_view_id = 0;
     player->plane_frames_without_present = 0;
     player->webview_gpu = NULL;
+    player->webview_direct = NULL;
+    player->creating_direct = false;
     if (getenv("FLUTTERPI_WEBVIEW_ON_PLANE") != NULL) {
         player->dmabuf_surface = dmabuf_surface_new(
             flutterpi_get_tracer(player->flutterpi),
@@ -1769,6 +1845,10 @@ int64_t gstplayer_get_position(struct gstplayer *player) {
     gboolean ok;
     int64_t position;
 
+    if (player->pipeline == NULL) {
+        return 0;
+    }
+
     GstStateChangeReturn statechange = gst_element_get_state(GST_ELEMENT(player->pipeline), &current, &pending, 0);
     if (statechange == GST_STATE_CHANGE_FAILURE) {
         LOG_GST_GET_STATE_ERROR(player->pipeline);
@@ -1816,6 +1896,7 @@ int gstplayer_step_forward(struct gstplayer *player) {
 
     ASSERT_NOT_NULL(player);
 
+    if (player->pipeline == NULL) return EOPNOTSUPP;
     player->playpause_state = kStepping;
     player->direction = kForward;
     ok = apply_playback_state(player);
@@ -1838,6 +1919,10 @@ int gstplayer_send_navigation_event(struct gstplayer *player, GstEvent *event) {
 
     ASSERT_NOT_NULL(player);
     ASSERT_NOT_NULL(event);
+
+    if (player->webview_direct != NULL) {
+        return webview_direct_send_navigation_event(player->webview_direct, event);
+    }
 
     switch (gst_navigation_event_get_type(event)) {
         case GST_NAVIGATION_EVENT_MOUSE_MOVE:
@@ -1870,6 +1955,7 @@ int gstplayer_web_load_url(struct gstplayer *player, const char *url) {
     struct web_task *task;
     ASSERT_NOT_NULL(player);
     ASSERT_NOT_NULL(url);
+    if (player->webview_direct != NULL) return webview_direct_load_url(player->webview_direct, url);
 
     task = calloc(1, sizeof(*task));
     if (task == NULL) return ENOMEM;
@@ -1885,6 +1971,7 @@ int gstplayer_web_load_url(struct gstplayer *player, const char *url) {
 int gstplayer_web_load_bytes(struct gstplayer *player, const uint8_t *data, size_t size) {
     struct web_task *task;
     ASSERT_NOT_NULL(player);
+    if (player->webview_direct != NULL) return webview_direct_load_bytes(player->webview_direct, data, size);
 
     task = calloc(1, sizeof(*task));
     if (task == NULL) return ENOMEM;
@@ -1901,6 +1988,7 @@ int gstplayer_web_run_javascript(struct gstplayer *player, const char *source) {
     struct web_task *task;
     ASSERT_NOT_NULL(player);
     ASSERT_NOT_NULL(source);
+    if (player->webview_direct != NULL) return webview_direct_run_javascript(player->webview_direct, source);
 
     task = calloc(1, sizeof(*task));
     if (task == NULL) return ENOMEM;
@@ -1956,6 +2044,7 @@ int gstplayer_step_backward(struct gstplayer *player) {
 
     ASSERT_NOT_NULL(player);
 
+    if (player->pipeline == NULL) return EOPNOTSUPP;
     player->playpause_state = kStepping;
     player->direction = kBackward;
     ok = apply_playback_state(player);

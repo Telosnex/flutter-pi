@@ -15,12 +15,22 @@
 #define _FLUTTERPI_SRC_PLUGINS_GSTREAMER_VIDEO_PLAYER_WEBVIEW_GPU_H
 
 #include <stdbool.h>
+#include <stdint.h>
 
 #include <gst/gst.h>
 
 struct gbm_device;
 struct dmabuf;
 struct webview_gpu;
+
+/// A single-plane DMA-BUF frame, as WPEPlatform hands it over.
+struct webview_gpu_source {
+    int width, height;
+    uint32_t fourcc;
+    int fd;
+    uint32_t stride, offset;
+    uint64_t modifier;
+};
 
 /// True when FLUTTERPI_WEBVIEW_GPU is set. Requires the plane path.
 bool webview_gpu_requested(void);
@@ -52,6 +62,11 @@ bool webview_gpu_sample_has_image(GstSample *sample);
 /// dmabuf_surface release callback. Returns EAGAIN when all buffers are on
 /// screen; drop the frame in that case.
 int webview_gpu_copy_sample(struct webview_gpu *gpu, GstSample *sample, struct dmabuf *dmabuf_out);
+
+/// Same as webview_gpu_copy_sample(), for a DMA-BUF frame. Does not take
+/// ownership of @src->fd. When this returns, the GPU has finished reading
+/// the source, so the caller can hand it back to its producer right away.
+int webview_gpu_copy_dmabuf(struct webview_gpu *gpu, const struct webview_gpu_source *src, struct dmabuf *dmabuf_out);
 
 /// Return the source image while its WPE view is still alive, including drops.
 void webview_gpu_release_sample(GstSample *sample);

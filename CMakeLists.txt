@@ -341,6 +341,7 @@ if (BUILD_GSTREAMER_VIDEO_PLAYER_PLUGIN)
         src/plugins/gstreamer_video_player/player.c
         src/plugins/gstreamer_video_player/frame.c
         src/plugins/gstreamer_video_player/webview_gpu.c
+        src/plugins/gstreamer_video_player/webview_direct.c
       )
       target_link_libraries(flutterpi_module PUBLIC
         PkgConfig::LIBGSTREAMER
