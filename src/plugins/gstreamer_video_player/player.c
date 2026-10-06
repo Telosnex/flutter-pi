@@ -4,6 +4,8 @@
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include "dmabuf_surface.h"
 #include "surface.h"
 #include "compositor_ng.h"
@@ -1790,6 +1792,9 @@ int64_t gstplayer_get_texture_id(struct gstplayer *player) {
 }
 
 bool gstplayer_supports_pixel_scroll(struct gstplayer *player) {
+    // FLUTTERPI_WEBVIEW_PIXEL_SCROLL=0 restores 40 px wheel steps for A/B tests.
+    const char *env = getenv("FLUTTERPI_WEBVIEW_PIXEL_SCROLL");
+    if (env != NULL && strcmp(env, "0") == 0) return false;
     return player->webview_direct != NULL;
 }
 

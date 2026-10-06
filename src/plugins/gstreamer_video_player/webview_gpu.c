@@ -55,7 +55,11 @@ typedef void (*wg_image_target_texture_t)(GLenum target, void *image);
 #define WPE_EGL_IMAGE_QUARK "GstWPEEGLImage"
 
 /// Scanout buffers in rotation: one on screen, one queued, one being drawn.
-#define N_SLOTS 3
+// One slot on screen, one in a pending page flip, one queued as the
+// surface's next frame, and one to copy the newest WebKit frame into. With
+// three, a fast producer dropped its newest frame and the queued, older one
+// stayed visible.
+#define N_SLOTS 4
 
 /// WebKit cycles through a few render buffers. Imports are cached per buffer.
 #define N_SOURCE_CACHE 6

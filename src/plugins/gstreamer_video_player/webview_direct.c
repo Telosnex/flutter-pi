@@ -417,6 +417,10 @@ static gboolean create_on_thread(void *userdata) {
     ((FlutterpiWpeView *) wpe_view)->owner = view;
 
     webkit_settings_set_enable_webaudio(webkit_web_view_get_settings(web_view), TRUE);
+    // Scroll physics come from Flutter, which sends precise pixel deltas each
+    // frame. WebKit's own scroll animation would smooth them a second time,
+    // making the page lag behind the fingers.
+    webkit_settings_set_enable_smooth_scrolling(webkit_web_view_get_settings(web_view), FALSE);
     if (view->configure != NULL) {
         view->configure(G_OBJECT(web_view), view->userdata);
     }
