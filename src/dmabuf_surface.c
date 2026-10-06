@@ -36,10 +36,12 @@
 #include "dmabuf_surface.h"
 
 #include <errno.h>
-#include <stdatomic.h>
+#include <inttypes.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdlib.h>
+
+#include <drm_fourcc.h>
 
 #include "compositor_ng.h"
 #include "surface.h"
@@ -58,6 +60,8 @@ struct refcounted_dmabuf {
 
     struct drmdev *drmdev;
     uint32_t drm_fb_id;
+    /// The display could not make a framebuffer from this buffer.
+    bool import_failed;
 };
 
 static atomic_uint n_unshown;
@@ -69,10 +73,12 @@ unsigned dmabuf_surface_take_unshown_count(void) {
 void refcounted_dmabuf_destroy(struct refcounted_dmabuf *dmabuf) {
     // No framebuffer means the buffer was replaced before it was ever shown.
     if (!DRM_ID_IS_VALID(dmabuf->drm_fb_id)) atomic_fetch_add(&n_unshown, 1);
-    dmabuf->release_callback(&dmabuf->buf);
+    // Drop the framebuffer before the producer gets the buffer back: with
+    // direct scanout the producer renders into it again.
     if (DRM_ID_IS_VALID(dmabuf->drm_fb_id)) {
         drmdev_rm_fb(dmabuf->drmdev, dmabuf->drm_fb_id);
     }
+    dmabuf->release_callback(&dmabuf->buf);
     // A buffer pushed but never presented has no drmdev/fb yet: the fb is only
     // created in present_kms(). Destroying it must not unref a NULL drmdev.
     if (dmabuf->drmdev != NULL) {
@@ -101,9 +107,17 @@ struct dmabuf_surface {
     /// layer. Until that happens the producer must keep feeding its texture,
     /// otherwise a platform view that never composites shows nothing at all.
     bool presented_once;
+
+    /// Set when a pushed buffer could not be turned into a framebuffer.
+    atomic_bool import_failed;
 };
 
 COMPILE_ASSERT(offsetof(struct dmabuf_surface, surface) == 0);
+
+bool dmabuf_surface_take_import_failed(struct dmabuf_surface *s) {
+    return atomic_exchange(&s->import_failed, false);
+}
+
 
 #ifdef DEBUG
 static const uuid_t uuid = CONST_UUID(0x68, 0xed, 0xe5, 0x8a, 0x4a, 0x2b, 0x40, 0x76, 0xa1, 0xb8, 0x89, 0x2e, 0x81, 0xfa, 0xe2, 0xb7);
@@ -283,6 +297,12 @@ static int dmabuf_surface_present_kms(struct surface *_s, const struct fl_layer_
         return 0;
     }
 
+    if (s->next_buf->import_failed) {
+        // Already reported; showing nothing beats failing the whole commit.
+        surface_unlock(_s);
+        return 0;
+    }
+
     if (DRM_ID_IS_VALID(s->next_buf->drm_fb_id)) {
         ASSERT_EQUALS_MSG(s->next_buf->drmdev, kms_req_builder_get_drmdev(builder), "Only 1 KMS instance per dmabuf supported right now.");
         fb_id = s->next_buf->drm_fb_id;
@@ -299,7 +319,17 @@ static int dmabuf_surface_present_kms(struct surface *_s, const struct fl_layer_
             s->next_buf->buf.modifiers[0]
         );
         if (!DRM_ID_IS_VALID(fb_id)) {
-            LOG_ERROR("Couldn't add dmabuf as framebuffer.\n");
+            LOG_ERROR(
+                "Couldn't add dmabuf as framebuffer (%dx%d stride %d modifier 0x%016" PRIx64 ").\n",
+                s->next_buf->buf.width,
+                s->next_buf->buf.height,
+                s->next_buf->buf.strides[0],
+                (uint64_t) (s->next_buf->buf.has_modifiers ? s->next_buf->buf.modifiers[0] : DRM_FORMAT_MOD_INVALID)
+            );
+            s->next_buf->import_failed = true;
+            atomic_store(&s->import_failed, true);
+            surface_unlock(_s);
+            return 0;
         }
 
         s->next_buf->drm_fb_id = fb_id;

@@ -44,6 +44,10 @@ MUST_CHECK struct dmabuf_surface *dmabuf_surface_new(struct tracer *tracer, stru
 /// (diagnostics, all surfaces).
 unsigned dmabuf_surface_take_unshown_count(void);
 
+/// True (once) if the display could not make a framebuffer from a pushed
+/// buffer since the last call. Such buffers are skipped, not shown.
+bool dmabuf_surface_take_import_failed(struct dmabuf_surface *s);
+
 int dmabuf_surface_push_dmabuf(struct dmabuf_surface *s, const struct dmabuf *buf, dmabuf_release_cb_t release_cb);
 
 /// True once the compositor has actually pushed this surface as a KMS layer.

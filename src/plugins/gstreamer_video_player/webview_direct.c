@@ -14,6 +14,7 @@
 #include <errno.h>
 #include <poll.h>
 #include <stdlib.h>
+#include <inttypes.h>
 #include <string.h>
 
 #include <EGL/egl.h>
@@ -21,6 +22,7 @@
 #include <gst/video/navigation.h>
 #include <wpe/webkit.h>
 #include <wpe/wpe-platform.h>
+#include <drm_fourcc.h>
 #include <xkbcommon/xkbcommon.h>
 
 #include "compositor_ng.h"
@@ -53,9 +55,18 @@ struct webview_direct {
     WPEView *wpe_view;
     gint64 created_us, first_frame_us;
     guint64 n_frames, n_copy_failures, n_not_dmabuf;
+    /// Put WebKit's own buffers on screen instead of copying. Cleared for
+    /// good once a buffer can't be scanned out.
+    bool scanout;
+    bool scanout_logged;
+    gint64 stats_start_us;
+    guint64 stats_scanout, stats_copied, stats_fence_us, stats_fence_max_us;
     /// The frame WebKit is waiting on: it starts the next one only after
     /// wpe_view_buffer_rendered(), which we send at the next page flip.
     WPEBuffer *waiting_buffer;
+    /// The display holds waiting_buffer; it is released separately, when
+    /// the display lets go of it.
+    bool waiting_on_screen;
     GSource *waiting_timeout;
 
     // Latest coalesced pointer move, guarded by move_lock.
@@ -117,26 +128,166 @@ static void wait_for_fence(int fd) {
     }
 }
 
-static void present_frame(struct webview_direct *view, WPEBuffer *buffer) {
+/// FLUTTERPI_WEBVIEW_SCANOUT=0 keeps the copy. Read once.
+static bool scanout_allowed(void) {
+    static int allowed = -1;
+    if (allowed < 0) {
+        const char *env = getenv("FLUTTERPI_WEBVIEW_SCANOUT");
+        allowed = env == NULL || strcmp(env, "0") != 0;
+    }
+    return allowed;
+}
+
+/// A WebKit buffer on the display. Released from any thread.
+struct scanout_hold {
+    WPEView *wpe_view;
+    WPEBuffer *buffer;
+};
+
+static GMainContext *webkit_context(void);
+
+static gboolean release_scanout_on_thread(void *userdata) {
+    struct scanout_hold *hold = userdata;
+    // WebKit may render into it again now.
+    wpe_view_buffer_released(hold->wpe_view, hold->buffer);
+    g_object_unref(hold->buffer);
+    g_object_unref(hold->wpe_view);
+    free(hold);
+    return G_SOURCE_REMOVE;
+}
+
+/// Display thread (or the pushing thread, if the buffer was replaced before
+/// it was shown). The framebuffer is already gone.
+static void on_scanout_release(struct dmabuf *dmabuf) {
+    g_main_context_invoke_full(webkit_context(), G_PRIORITY_HIGH, release_scanout_on_thread, dmabuf->userdata, NULL);
+    dmabuf->userdata = NULL;
+}
+
+/// Returns true if the buffer went to the display as is.
+static bool try_scanout(struct webview_direct *view, WPEBuffer *buffer, WPEBufferDMABuf *dmabuf_buffer, int fd) {
+    uint32_t fourcc = wpe_buffer_dma_buf_get_format(dmabuf_buffer);
+    uint64_t modifier = wpe_buffer_dma_buf_get_modifier(dmabuf_buffer);
+    struct scanout_hold *hold;
+    int ok;
+
+    if (dmabuf_surface_take_import_failed(view->surface)) {
+        LOG_ERROR("webview: the display can't scan out WebKit's buffers; copying them instead.\n");
+        view->scanout = false;
+    }
+    if (!view->scanout) return false;
+
+    if ((fourcc != DRM_FORMAT_ARGB8888 && fourcc != DRM_FORMAT_XRGB8888) || modifier != DRM_FORMAT_MOD_LINEAR) {
+        if (!view->scanout_logged) {
+            LOG_ERROR(
+                "webview: WebKit rendered %.4s modifier 0x%016" PRIx64 ", which the display can't take; copying instead.\n",
+                (const char *) &fourcc,
+                modifier
+            );
+        }
+        view->scanout_logged = true;
+        view->scanout = false;
+        return false;
+    }
+    if (!view->scanout_logged) {
+        view->scanout_logged = true;
+        LOG_STATS(
+            "direct scanout of WebKit buffers (%.4s linear %dx%d stride %u)\n",
+            (const char *) &fourcc,
+            wpe_buffer_get_width(buffer),
+            wpe_buffer_get_height(buffer),
+            wpe_buffer_dma_buf_get_stride(dmabuf_buffer, 0)
+        );
+    }
+
+    hold = malloc(sizeof *hold);
+    if (hold == NULL) return false;
+    hold->wpe_view = g_object_ref(view->wpe_view);
+    hold->buffer = g_object_ref(buffer);
+
+    ok = dmabuf_surface_push_dmabuf(
+        view->surface,
+        &(struct dmabuf){
+            .format = fourcc == DRM_FORMAT_ARGB8888 ? PIXFMT_ARGB8888 : PIXFMT_XRGB8888,
+            .width = wpe_buffer_get_width(buffer),
+            .height = wpe_buffer_get_height(buffer),
+            .fds = { fd, -1, -1, -1 },
+            .offsets = { (int) wpe_buffer_dma_buf_get_offset(dmabuf_buffer, 0) },
+            .strides = { (int) wpe_buffer_dma_buf_get_stride(dmabuf_buffer, 0) },
+            .has_modifiers = true,
+            .modifiers = { modifier },
+            .userdata = hold,
+        },
+        on_scanout_release
+    );
+    if (ok != 0) {
+        // Not pushed, so no release callback; hand it back right away.
+        g_object_unref(hold->buffer);
+        g_object_unref(hold->wpe_view);
+        free(hold);
+        LOG_ERROR("webview: could not push WebKit's buffer: %s; copying instead.\n", strerror(ok));
+        view->scanout = false;
+        return false;
+    }
+    return true;
+}
+
+static void log_frame_stats(struct webview_direct *view, gint64 fence_us) {
+    gint64 now = g_get_monotonic_time();
+    if (getenv("FLUTTERPI_WEBVIEW_STATS") == NULL) return;
+    view->stats_fence_us += fence_us;
+    if (fence_us > (gint64) view->stats_fence_max_us) view->stats_fence_max_us = fence_us;
+    if (view->stats_start_us == 0) view->stats_start_us = now;
+    if (now - view->stats_start_us >= 5000000) {
+        guint64 n = view->stats_scanout + view->stats_copied;
+        LOG_STATS(
+            "%.1f fps: %" PRIu64 " scanned out, %" PRIu64 " copied; fence wait avg %.2f ms max %.2f ms\n",
+            n * 1e6 / (double) (now - view->stats_start_us),
+            view->stats_scanout,
+            view->stats_copied,
+            n ? view->stats_fence_us / (double) n / 1000.0 : 0.0,
+            view->stats_fence_max_us / 1000.0
+        );
+        view->stats_start_us = now;
+        view->stats_scanout = view->stats_copied = view->stats_fence_us = view->stats_fence_max_us = 0;
+    }
+}
+
+/// Returns true if the display now holds @p buffer (direct scanout).
+static bool present_frame(struct webview_direct *view, WPEBuffer *buffer) {
     WPEBufferDMABuf *dmabuf_buffer;
     struct dmabuf dmabuf;
+    gint64 fence_start;
     int fd, ok;
 
     if (!WPE_IS_BUFFER_DMA_BUF(buffer)) {
         if (view->n_not_dmabuf++ == 0) {
             LOG_ERROR("WebKit handed over a %s frame; only DMA-BUF frames are shown.\n", G_OBJECT_TYPE_NAME(buffer));
         }
-        return;
+        return false;
     }
     dmabuf_buffer = WPE_BUFFER_DMA_BUF(buffer);
     if (wpe_buffer_dma_buf_get_n_planes(dmabuf_buffer) != 1) {
         if (view->n_not_dmabuf++ == 0) {
             LOG_ERROR("WebKit handed over a multi-plane frame; only single-plane frames are shown.\n");
         }
-        return;
+        return false;
     }
     fd = wpe_buffer_dma_buf_get_fd(dmabuf_buffer, 0);
+    fence_start = g_get_monotonic_time();
     wait_for_fence(wpe_buffer_get_rendering_fence(buffer));
+
+    if (view->n_frames++ == 0) {
+        view->first_frame_us = g_get_monotonic_time();
+        LOG_STATS("first frame after %.0f ms\n", (view->first_frame_us - view->created_us) / 1000.0);
+    }
+
+    if (try_scanout(view, buffer, dmabuf_buffer, fd)) {
+        view->stats_scanout++;
+        log_frame_stats(view, g_get_monotonic_time() - fence_start);
+        return true;
+    }
+    view->stats_copied++;
+    log_frame_stats(view, g_get_monotonic_time() - fence_start);
 
     ok = webview_gpu_copy_dmabuf(
         view->gpu,
@@ -157,10 +308,7 @@ static void present_frame(struct webview_direct *view, WPEBuffer *buffer) {
     } else if (ok != EAGAIN && view->n_copy_failures++ == 0) {
         LOG_ERROR("Could not copy the webview frame on the GPU: %s\n", strerror(ok));
     }
-    if (view->n_frames++ == 0) {
-        view->first_frame_us = g_get_monotonic_time();
-        LOG_STATS("first frame after %.0f ms\n", (view->first_frame_us - view->created_us) / 1000.0);
-    }
+    return false;
 }
 
 /// Hands the waiting frame back to WebKit, letting it start the next one.
@@ -176,8 +324,10 @@ static void finish_waiting_frame(struct webview_direct *view) {
     view->waiting_buffer = NULL;
     if (view->wpe_view != NULL) {
         wpe_view_buffer_rendered(view->wpe_view, buffer);
-        wpe_view_buffer_released(view->wpe_view, buffer);
+        // A scanned-out buffer is released when the display lets go of it.
+        if (!view->waiting_on_screen) wpe_view_buffer_released(view->wpe_view, buffer);
     }
+    view->waiting_on_screen = false;
     g_object_unref(buffer);
 }
 
@@ -189,8 +339,6 @@ static gboolean finish_on_thread(void *userdata) {
 static void destroy_view_ref(void *userdata) {
     view_unref(userdata);
 }
-
-static GMainContext *webkit_context(void);
 
 /// Display thread, at the page flip after the frame was committed.
 static void on_frame_scanout(void *userdata) {
@@ -228,7 +376,7 @@ static gboolean flutterpi_wpe_view_render_buffer(
     // WebKit should not send a frame before the previous one is finished;
     // if it does, finish the old one first.
     finish_waiting_frame(view);
-    present_frame(view, buffer);
+    bool on_screen = present_frame(view, buffer);
 
     // The copy has finished reading the buffer (webview_gpu waits for the
     // GPU), but WebKit only gets it back at the next page flip, which paces
@@ -236,6 +384,7 @@ static gboolean flutterpi_wpe_view_render_buffer(
     // second that are never shown. The repaint also puts the frame on screen
     // when Flutter itself is idle. Only this thread holds WebKit buffers.
     view->waiting_buffer = g_object_ref(buffer);
+    view->waiting_on_screen = on_screen;
     if (compositor_request_repaint(view->compositor, on_frame_scanout, view_ref(view)) != 0) {
         // No listener was registered (nothing composited yet, or no KMS).
         view_unref(view);
@@ -340,6 +489,25 @@ static WPEKeymap *flutterpi_wpe_display_get_keymap(WPEDisplay *display) {
     return self->keymap;
 }
 
+/// Asks WebKit for buffers the display planes can scan out directly:
+/// linear (A|X)RGB8888 on the render device, flagged for scanout. The vc4
+/// planes also take VC4_T_TILED, but V3D can't render that.
+static WPEBufferFormats *flutterpi_wpe_display_get_preferred_buffer_formats(WPEDisplay *display) {
+    FlutterpiWpeDisplay *self = (FlutterpiWpeDisplay *) display;
+    WPEBufferFormatsBuilder *builder;
+    WPEBufferFormats *formats;
+
+    if (!scanout_allowed() || self->drm_device == NULL) return NULL;
+
+    builder = wpe_buffer_formats_builder_new(self->drm_device);
+    wpe_buffer_formats_builder_append_group(builder, self->drm_device, WPE_BUFFER_FORMAT_USAGE_SCANOUT);
+    wpe_buffer_formats_builder_append_format(builder, DRM_FORMAT_ARGB8888, DRM_FORMAT_MOD_LINEAR);
+    wpe_buffer_formats_builder_append_format(builder, DRM_FORMAT_XRGB8888, DRM_FORMAT_MOD_LINEAR);
+    formats = wpe_buffer_formats_builder_end(builder);
+    wpe_buffer_formats_builder_unref(builder);
+    return formats;
+}
+
 static void flutterpi_wpe_display_init(FlutterpiWpeDisplay *self) {
     self->egl_display = EGL_NO_DISPLAY;
 }
@@ -351,6 +519,7 @@ static void flutterpi_wpe_display_class_init(FlutterpiWpeDisplayClass *klass) {
     display_class->get_egl_display = flutterpi_wpe_display_get_egl_display;
     display_class->get_drm_device = flutterpi_wpe_display_get_drm_device;
     display_class->get_keymap = flutterpi_wpe_display_get_keymap;
+    display_class->get_preferred_buffer_formats = flutterpi_wpe_display_get_preferred_buffer_formats;
 }
 
 /* ------------------------------------------------------------------------- */
@@ -540,6 +709,7 @@ struct webview_direct *webview_direct_new(
     view->gpu = gpu;
     view->surface = surface;
     view->compositor = compositor;
+    view->scanout = scanout_allowed();
     view->width = width;
     view->height = height;
     view->configure = configure;
