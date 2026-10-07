@@ -1258,10 +1258,8 @@ static int kms_window_push_composition_locked(struct window *window, struct fl_l
     fl_layer_composition_swap_ptrs(&window->composition, composition);
 
     builder = drmdev_create_request_builder(window->kms.drmdev, window->kms.crtc->id);
-    if (builder == NULL) {
-        ok = ENOMEM;
-        goto fail_unref_builder;
-    }
+    if (builder == NULL)
+        return ENOMEM;
 
     // We only set the mode once, at the first atomic request.
     if (window->kms.should_apply_mode) {
@@ -1404,10 +1402,18 @@ int window_request_repaint(struct window *window, void_callback_t on_scanout, vo
     ok = kms_window_push_composition_locked(window, window->composition);
     window_unlock(window);
 
-    // If the push failed before reaching the scheduler, the listener still
-    // fires at the next flip of some other commit, or never if the display
-    // is idle; callers keep a timeout for that.
+    if (ok != 0 && on_scanout != NULL) {
+        // An error must mean no callback will run. A flip may have raced us
+        // and already taken the listener, in which case report acceptance:
+        // that callback (possibly already running) owns userdata now.
+        if (!frame_scheduler_cancel_scanout_listener(window->frame_scheduler, on_scanout, userdata))
+            return 0;
+    }
     return ok;
+}
+
+bool window_cancel_repaint(struct window *window, void_callback_t on_scanout, void *userdata) {
+    return frame_scheduler_cancel_scanout_listener(window->frame_scheduler, on_scanout, userdata);
 }
 
 static bool count_modifiers_for_pixel_format(
@@ -1458,7 +1464,10 @@ static struct render_surface *kms_window_get_render_surface_internal(struct wind
     ASSERT_NOT_NULL(window);
 
     if (window->render_surface != NULL) {
-        return window->render_surface;
+        struct vec2i cached_size = render_surface_get_size(window->render_surface);
+        if (!has_size || (cached_size.x == size.x && cached_size.y == size.y)) {
+            return window->render_surface;
+        }
     }
 
     if (!has_size) {
@@ -1527,7 +1536,16 @@ static struct render_surface *kms_window_get_render_surface_internal(struct wind
             drm_plane_for_each_modified_format(plane, count_modifiers_for_pixel_format, &context);
 
             n_allowed_modifiers = context.n_modifiers;
+            if (n_allowed_modifiers == 0) {
+                // This plane does not advertise modifiers for our format.
+                continue;
+            }
             allowed_modifiers = calloc(n_allowed_modifiers, sizeof(*context.modifiers));
+            if (allowed_modifiers == NULL) {
+                LOG_ERROR("Couldn't allocate rendering surface modifiers.\n");
+                // Do not replace the cached surface on allocation failure.
+                return NULL;
+            }
             context.modifiers = allowed_modifiers;
 
             // Next, fill context.modifiers with the allowed modifiers.
@@ -1586,7 +1604,11 @@ static struct render_surface *kms_window_get_render_surface_internal(struct wind
         free(allowed_modifiers);
     }
 
-    window->render_surface = render_surface;
+    if (render_surface != NULL) {
+        struct render_surface *old = window->render_surface;
+        window->render_surface = render_surface;
+        if (old != NULL) surface_unref(CAST_SURFACE(old));
+    }
     return render_surface;
 }
 

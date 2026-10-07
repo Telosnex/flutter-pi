@@ -26,6 +26,7 @@ struct render_surface {
 
     struct vec2i size;
     int (*fill)(struct render_surface *surface, FlutterBackingStore *fl_store);
+    struct surface *(*get_present_surface)(struct render_surface *surface, const FlutterBackingStore *fl_store);
     int (*queue_present)(struct render_surface *surface, const FlutterBackingStore *fl_store);
 };
 

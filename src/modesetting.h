@@ -834,13 +834,13 @@ bool kms_req_builder_prefer_next_layer_opaque(struct kms_req_builder *builder);
  * the GPU has finished rendering to the framebuffer and it is ready to be
  * scanned out.
  *
- * Ownership: On success, the request takes ownership of the in_fence_fd,
- * regardless of whether explicit fencing is actually supported by the plane.
- * With atomic modesetting, the fd is attached to the plane's IN_FENCE_FD
- * property (if the plane has one; the kernel dup()s it at commit time) and
- * closed when the request is destroyed. With legacy modesetting, explicit
- * fencing is not supported and the fd is closed immediately; the driver's
- * implicit synchronization is used instead.
+ * Ownership: On success, the request takes ownership of the in_fence_fd and
+ * attaches it to the atomic plane's IN_FENCE_FD property. It is closed when
+ * the request is destroyed. Legacy modesetting or a plane without explicit
+ * fence support returns EOPNOTSUPP without consuming fd or callback userdata;
+ * the producer may wait for completion and retry without a fence.
+ * Atomic property-add failure also preserves caller ownership and rolls the
+ * partially appended properties back.
  *
  * @param deferred_release_callback is intended to provide an out-fence
  * (OUT_FENCE_PTR) based release signal in the future; it's unimplemented right

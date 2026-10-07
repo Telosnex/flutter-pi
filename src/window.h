@@ -126,10 +126,16 @@ int window_push_composition(struct window *window, struct fl_layer_composition *
  * @brief Re-commits the last composition so platform-view planes show their
  * newest buffer without Flutter drawing a frame. Any thread.
  *
- * @param on_scanout Optional; called once at the next page flip.
- * @returns 0, ENOTSUP (no KMS), EAGAIN (nothing composited yet), EBUSY.
+ * @param on_scanout Optional; called once at the next flip, failure or shutdown.
+ * @returns 0 if accepted (callback may already have run); any error guarantees
+ * no callback will run. A successful request can be cancelled with
+ * window_cancel_repaint, e.g. when the caller's timeout expires.
  */
 int window_request_repaint(struct window *window, void_callback_t on_scanout, void *userdata);
+
+/// True: callback removed, caller owns userdata. False: already dispatched,
+/// possibly still running; callback owns userdata. Use a unique pair per request.
+bool window_cancel_repaint(struct window *window, void_callback_t on_scanout, void *userdata);
 
 /**
  * @brief Get the current view geometry of this window.

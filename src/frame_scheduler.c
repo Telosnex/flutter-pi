@@ -154,12 +154,16 @@ frame_scheduler_new(bool uses_frame_requests, enum present_mode present_mode, fl
     return scheduler;
 }
 
+static void frame_scheduler_fire_scanout_listeners(struct frame_scheduler *scheduler);
+
 void frame_scheduler_destroy(struct frame_scheduler *scheduler) {
     // If a queued frame is still present at destruction time, cancel it so its
     // resources are released.
     if (scheduler->has_queued_frame && scheduler->queued_frame.cancel_cb != NULL) {
         scheduler->queued_frame.cancel_cb(scheduler->queued_frame.userdata);
     }
+    // Accepted listeners own caller resources even if the display goes away.
+    frame_scheduler_fire_scanout_listeners(scheduler);
     pthread_mutex_destroy(&scheduler->mutex);
     free(scheduler);
 }
@@ -289,6 +293,20 @@ bool frame_scheduler_on_next_scanout(struct frame_scheduler *scheduler, void_cal
     }
     frame_scheduler_unlock(scheduler);
     return ok;
+}
+
+bool frame_scheduler_cancel_scanout_listener(struct frame_scheduler *scheduler, void_callback_t cb, void *userdata) {
+    bool removed = false;
+    frame_scheduler_lock(scheduler);
+    for (size_t i = 0; i < scheduler->n_scanout_listeners; i++) {
+        if (scheduler->scanout_listeners[i].cb == cb && scheduler->scanout_listeners[i].userdata == userdata) {
+            scheduler->scanout_listeners[i] = scheduler->scanout_listeners[--scheduler->n_scanout_listeners];
+            removed = true;
+            break;
+        }
+    }
+    frame_scheduler_unlock(scheduler);
+    return removed;
 }
 
 /// Takes the listeners out under the lock and calls them without it.

@@ -19,6 +19,7 @@
 #include <flutter_embedder.h>
 
 #include "util/collection.h"
+#include "util/geometry.h"
 
 struct surface;
 struct render_surface;
@@ -30,6 +31,11 @@ ATTR_PURE struct render_surface *__checked_cast_render_surface(void *ptr);
 #else
     #define CAST_RENDER_SURFACE(ptr) CAST_RENDER_SURFACE_UNCHECKED(ptr)
 #endif
+
+// Returns an owned, per-frame scanout surface when supported. Call only after
+// successful queue_present; NULL indicates allocation/validation failure.
+struct surface *render_surface_get_present_surface(struct render_surface *store, const FlutterBackingStore *fl_store);
+struct vec2i render_surface_get_size(struct render_surface *store);
 
 int render_surface_fill(struct render_surface *store, FlutterBackingStore *fl_store);
 

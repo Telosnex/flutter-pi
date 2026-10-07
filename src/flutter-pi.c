@@ -72,6 +72,7 @@
 
 #ifdef HAVE_VULKAN
     #include "vk_renderer.h"
+    #include "vk_queue_sync.h"
 #endif
 
 #ifdef ENABLE_MTRACE
@@ -428,7 +429,7 @@ UNUSED static void *on_get_vulkan_proc_address(void *userdata, FlutterVulkanInst
         name = "vkGetInstanceProcAddr";
     }
 
-    return (void *) vkGetInstanceProcAddr((VkInstance) instance, name);
+    return (void *) vk_queue_sync_get_instance_proc_addr((VkInstance) instance, name);
 #else
     (void) userdata;
     (void) instance;

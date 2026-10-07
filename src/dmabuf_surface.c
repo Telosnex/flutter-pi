@@ -153,6 +153,7 @@ int dmabuf_surface_init(struct dmabuf_surface *s, struct tracer *tracer, struct 
 
     ok = surface_init(&s->surface, tracer);
     if (ok != 0) {
+        texture_destroy(texture);
         return ok;
     }
 
@@ -175,7 +176,19 @@ int dmabuf_surface_init(struct dmabuf_surface *s, struct tracer *tracer, struct 
     return 0;
 }
 
+void dmabuf_surface_clear(struct dmabuf_surface *s) {
+    // KMS requests retain their own references until retirement. Only stop
+    // offering this buffer for future compositions; never release it early.
+    surface_lock(CAST_SURFACE_UNCHECKED(s));
+    struct refcounted_dmabuf *buffer = s->next_buf;
+    s->next_buf = NULL;
+    surface_unlock(CAST_SURFACE_UNCHECKED(s));
+    if (buffer != NULL)
+        refcounted_dmabuf_unref(buffer);
+}
+
 static void dmabuf_surface_deinit(struct surface *s) {
+    dmabuf_surface_clear(CAST_THIS_UNCHECKED(s));
     texture_destroy(CAST_THIS_UNCHECKED(s)->texture);
     surface_deinit(s);
 }
@@ -232,16 +245,13 @@ int dmabuf_surface_push_dmabuf(struct dmabuf_surface *s, const struct dmabuf *bu
     ASSERT_NOT_NULL(buf);
     ASSERT_NOT_NULL(release_cb);
 
-#ifdef HAVE_EGL_GLES2
-    assert(eglGetCurrentContext() != EGL_NO_CONTEXT);
-#endif
-
+    // This queues a DMA-BUF; it neither imports nor uses a GL context.
     b = malloc(sizeof *b);
     if (b == NULL) {
         return ENOMEM;
     }
 
-    b->n_refs = REFCOUNT_INIT_0;
+    b->n_refs = REFCOUNT_INIT_1;
     b->buf = *buf;
     b->release_callback = release_cb;
     b->drmdev = NULL;
@@ -252,23 +262,27 @@ int dmabuf_surface_push_dmabuf(struct dmabuf_surface *s, const struct dmabuf *bu
 
     ok = texture_push_unresolved_frame(
         s->texture,
-        &(const struct unresolved_texture_frame){
+        &(const struct unresolved_texture_frame) {
             .resolve = on_resolve_texture_frame,
-            .destroy = surface_unref_void,
-            .userdata = surface_ref(CAST_SURFACE_UNCHECKED(s)),
+            // The unimplemented resolver needs no surface. Holding one here
+            // creates a cycle: surface -> texture -> queued frame -> surface.
+            .destroy = NULL,
+            .userdata = NULL,
         }
     );
     if (ok != 0) {
         LOG_ERROR("Couldn't post new frame to texture.\n");
-        surface_unref(CAST_SURFACE_UNCHECKED(s));
         surface_unlock(CAST_SURFACE_UNCHECKED(s));
         free(b);
         return ok;
     }
 
-    refcounted_dmabuf_swap_ptrs(&s->next_buf, b);
-
+    struct refcounted_dmabuf *previous = s->next_buf;
+    s->next_buf = b;
     surface_unlock(CAST_SURFACE_UNCHECKED(s));
+    // Producer callbacks can reenter; never release under the surface lock.
+    if (previous != NULL)
+        refcounted_dmabuf_unref(previous);
 
     return 0;
 }

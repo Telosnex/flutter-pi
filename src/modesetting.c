@@ -2493,7 +2493,7 @@ static void kms_req_builder_destroy(struct kms_req_builder *builder) {
 
         // For atomic modesetting, we own the in-fence fd of every successfully
         // pushed layer. (The kernel dup()s it internally at commit time.)
-        // The legacy path already closed it in kms_req_builder_push_fb_layer.
+        // The legacy path rejects explicit fences; it never owns such an fd.
         if (!builder->use_legacy && builder->layers[i].layer.has_in_fence_fd) {
             assert(builder->layers[i].layer.in_fence_fd >= 0);
             close(builder->layers[i].layer.in_fence_fd);
@@ -2570,7 +2570,7 @@ int kms_req_builder_push_fb_layer(
     struct drm_plane *plane;
     int64_t zpos;
     bool has_zpos;
-    bool close_in_fence_fd_after;
+    int atomic_cursor = -1;
     int ok, index;
 
     ASSERT_NOT_NULL(builder);
@@ -2588,11 +2588,11 @@ int kms_req_builder_push_fb_layer(
         return EINVAL;
     }
 
-    close_in_fence_fd_after = false;
-    if (builder->use_legacy && layer->has_in_fence_fd) {
-        LOG_DEBUG("Explicit fencing is not supported for legacy modesetting. Implicit fencing will be used instead.\n");
-        close_in_fence_fd_after = true;
-    }
+    // An explicit dependency cannot safely become implicit for Vulkan buffers.
+    // Reject without consuming the caller's fd/reference if it cannot be passed
+    // to KMS. The producer may wait explicitly and retry without a fence.
+    if (builder->use_legacy && layer->has_in_fence_fd)
+        return EOPNOTSUPP;
 
     // Index of our layer.
     index = builder->n_layers;
@@ -2801,22 +2801,71 @@ int kms_req_builder_push_fb_layer(
     if (builder->use_legacy) {
     } else {
         uint32_t plane_id = plane->id;
+        if (layer->has_in_fence_fd && plane->ids.in_fence_fd == DRM_ID_NONE) {
+            ok = EOPNOTSUPP;
+            goto fail_release_plane;
+        }
+        atomic_cursor = drmModeAtomicGetCursor(builder->req);
 
-        /// TODO: Error checking
+        /// All property additions must succeed, including the explicit fence.
         /// TODO: Maybe add these in the kms_req_builder_commit instead?
-        drmModeAtomicAddProperty(builder->req, plane_id, plane->ids.crtc_id, builder->crtc->id);
-        drmModeAtomicAddProperty(builder->req, plane_id, plane->ids.fb_id, layer->drm_fb_id);
-        drmModeAtomicAddProperty(builder->req, plane_id, plane->ids.crtc_x, layer->dst_x);
-        drmModeAtomicAddProperty(builder->req, plane_id, plane->ids.crtc_y, layer->dst_y);
-        drmModeAtomicAddProperty(builder->req, plane_id, plane->ids.crtc_w, layer->dst_w);
-        drmModeAtomicAddProperty(builder->req, plane_id, plane->ids.crtc_h, layer->dst_h);
-        drmModeAtomicAddProperty(builder->req, plane_id, plane->ids.src_x, layer->src_x);
-        drmModeAtomicAddProperty(builder->req, plane_id, plane->ids.src_y, layer->src_y);
-        drmModeAtomicAddProperty(builder->req, plane_id, plane->ids.src_w, layer->src_w);
-        drmModeAtomicAddProperty(builder->req, plane_id, plane->ids.src_h, layer->src_h);
+        ok = drmModeAtomicAddProperty(builder->req, plane_id, plane->ids.crtc_id, builder->crtc->id);
+        if (ok < 0) {
+            ok = -ok;
+            goto fail_release_plane;
+        }
+        ok = drmModeAtomicAddProperty(builder->req, plane_id, plane->ids.fb_id, layer->drm_fb_id);
+        if (ok < 0) {
+            ok = -ok;
+            goto fail_release_plane;
+        }
+        ok = drmModeAtomicAddProperty(builder->req, plane_id, plane->ids.crtc_x, layer->dst_x);
+        if (ok < 0) {
+            ok = -ok;
+            goto fail_release_plane;
+        }
+        ok = drmModeAtomicAddProperty(builder->req, plane_id, plane->ids.crtc_y, layer->dst_y);
+        if (ok < 0) {
+            ok = -ok;
+            goto fail_release_plane;
+        }
+        ok = drmModeAtomicAddProperty(builder->req, plane_id, plane->ids.crtc_w, layer->dst_w);
+        if (ok < 0) {
+            ok = -ok;
+            goto fail_release_plane;
+        }
+        ok = drmModeAtomicAddProperty(builder->req, plane_id, plane->ids.crtc_h, layer->dst_h);
+        if (ok < 0) {
+            ok = -ok;
+            goto fail_release_plane;
+        }
+        ok = drmModeAtomicAddProperty(builder->req, plane_id, plane->ids.src_x, layer->src_x);
+        if (ok < 0) {
+            ok = -ok;
+            goto fail_release_plane;
+        }
+        ok = drmModeAtomicAddProperty(builder->req, plane_id, plane->ids.src_y, layer->src_y);
+        if (ok < 0) {
+            ok = -ok;
+            goto fail_release_plane;
+        }
+        ok = drmModeAtomicAddProperty(builder->req, plane_id, plane->ids.src_w, layer->src_w);
+        if (ok < 0) {
+            ok = -ok;
+            goto fail_release_plane;
+        }
+        ok = drmModeAtomicAddProperty(builder->req, plane_id, plane->ids.src_h, layer->src_h);
+        if (ok < 0) {
+            ok = -ok;
+            goto fail_release_plane;
+        }
 
         if (plane->has_zpos && !plane->has_hardcoded_zpos) {
-            drmModeAtomicAddProperty(builder->req, plane_id, plane->ids.zpos, zpos);
+            ok = drmModeAtomicAddProperty(builder->req, plane_id, plane->ids.zpos, zpos);
+            if (ok < 0) {
+                ok = -ok;
+                goto fail_release_plane;
+            }
         }
 
         if (layer->has_rotation) {
@@ -2829,7 +2878,11 @@ int kms_req_builder_push_fb_layer(
                 !(layer->rotation.u32 & ~plane->supported_rotations.u32);
 
             if (can_apply_rotation && !plane->has_hardcoded_rotation) {
-                drmModeAtomicAddProperty(builder->req, plane_id, plane->ids.rotation, layer->rotation.u64);
+                ok = drmModeAtomicAddProperty(builder->req, plane_id, plane->ids.rotation, layer->rotation.u64);
+                if (ok < 0) {
+                    ok = -ok;
+                    goto fail_release_plane;
+                }
             } else if (!can_apply_rotation && layer->enforce_rotation) {
                 // Rotation was requested and must be enforced, but plane can't apply it
                 LOG_ERROR("Rotation requested with enforce_rotation=true, but plane %" PRIu32 " cannot apply it.\n", plane_id);
@@ -2841,41 +2894,30 @@ int kms_req_builder_push_fb_layer(
 
         if (index == 0) {
             if (plane->has_alpha) {
-                drmModeAtomicAddProperty(builder->req, plane_id, plane->ids.alpha, plane->max_alpha);
+                ok = drmModeAtomicAddProperty(builder->req, plane_id, plane->ids.alpha, plane->max_alpha);
+                if (ok < 0) {
+                    ok = -ok;
+                    goto fail_release_plane;
+                }
             }
 
             if (plane->has_blend_mode && plane->supported_blend_modes[kNone_DrmBlendMode]) {
-                drmModeAtomicAddProperty(builder->req, plane_id, plane->ids.pixel_blend_mode, kNone_DrmBlendMode);
+                ok = drmModeAtomicAddProperty(builder->req, plane_id, plane->ids.pixel_blend_mode, kNone_DrmBlendMode);
+                if (ok < 0) {
+                    ok = -ok;
+                    goto fail_release_plane;
+                }
             }
         }
 
         if (layer->has_in_fence_fd) {
-            if (plane->ids.in_fence_fd != DRM_ID_NONE) {
-                // The kernel dup()s the sync-file fd internally when the atomic
-                // commit ioctl is executed. We retain ownership of layer->in_fence_fd;
-                // it's closed in kms_req_builder_destroy.
-                drmModeAtomicAddProperty(builder->req, plane_id, plane->ids.in_fence_fd, layer->in_fence_fd);
-            } else {
-                // The buffer might still be implicitly synchronized (the driver
-                // waits for the attached dma-resv fences before scanning it out),
-                // but we can't express the explicit fence. Warn once per plane
-                // would be nicer, but this is a cold path anyway.
-                LOG_DEBUG(
-                    "Layer has an explicit render-completion fence, but the DRM plane doesn't support the IN_FENCE_FD property. "
-                    "Falling back to implicit synchronization.\n"
-                );
+            // Support was checked before appending any properties. The kernel
+            // dup()s the sync fd at commit; the builder owns it until destruction.
+            ok = drmModeAtomicAddProperty(builder->req, plane_id, plane->ids.in_fence_fd, layer->in_fence_fd);
+            if (ok < 0) {
+                ok = -ok;
+                goto fail_release_plane;
             }
-        }
-    }
-
-    // This should be done when we're sure we're not failing.
-    // Because on failure it would be the callers job to close the fd.
-    if (close_in_fence_fd_after) {
-        ok = close(layer->in_fence_fd);
-        if (ok < 0) {
-            ok = errno;
-            LOG_ERROR("Could not close layer in_fence_fd. close: %s\n", strerror(ok));
-            goto fail_release_plane;
         }
     }
 
@@ -2899,6 +2941,8 @@ int kms_req_builder_push_fb_layer(
     return 0;
 
 fail_release_plane:
+    if (atomic_cursor >= 0)
+        drmModeAtomicSetCursor(builder->req, atomic_cursor);
     release_plane(builder, plane->id);
     return ok;
 }

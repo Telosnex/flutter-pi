@@ -1,10 +1,21 @@
 #include <flutter-pi.h>
 #include <unity.h>
+#include <stdlib.h>
+#include <string.h>
+
+static struct flutterpi_cmdline_args actual;
+static void free_parsed_args(void) {
+    // Parser-owned strings; engine_argv points into the caller's argv.
+    free(actual.bundle_path);
+    free(actual.desired_videomode);
+    memset(&actual, 0, sizeof(actual));
+}
 
 void setUp() {
 }
 
 void tearDown() {
+    free_parsed_args();
 }
 
 #define TEST_ASSERT_EQUAL_BOOL(expected, actual)                                \
@@ -19,8 +30,8 @@ void tearDown() {
 #define BUNDLE_PATH "/path/to/bundle"
 
 void expect_parsed_cmdline_args_matches(int argc, char **argv, bool expected_result, const struct flutterpi_cmdline_args expected) {
-    struct flutterpi_cmdline_args actual;
     bool result;
+    free_parsed_args();
 
     result = flutterpi_parse_cmdline_args(argc, argv, &actual);
     TEST_ASSERT_EQUAL_BOOL(expected_result, result);

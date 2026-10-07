@@ -202,6 +202,7 @@ struct texture *texture_new(struct texture_registry *reg) {
     if (ok != 0) {
         pthread_mutex_destroy(&texture->lock);
         free(texture);
+        return NULL;
     }
 
     return texture;
@@ -317,10 +318,12 @@ texture_gl_external_texture_frame_callback(struct texture *texture, size_t width
             LOG_ERROR("Couldn't resolve texture frame.\n");
             counted_texture_frame_unrefp(&frame);
             counted_texture_frame_unrefp(&texture->next_frame);
+        } else {
+            if (frame->unresolved_frame.destroy != NULL) {
+                frame->unresolved_frame.destroy(frame->unresolved_frame.userdata);
+            }
+            frame->is_resolved = true;
         }
-
-        frame->unresolved_frame.destroy(frame->unresolved_frame.userdata);
-        frame->is_resolved = true;
     }
 
     texture_unlock(texture);
