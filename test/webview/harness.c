@@ -287,6 +287,59 @@ static void gv_free(struct gview *g) {
     g_free(g);
 }
 
+/* Real WPE viewport + frame-size regression, without changing the app service. */
+static bool wait_size(struct dmabuf_surface *s, unsigned width, unsigned height) {
+    gint64 end = g_get_monotonic_time() + 5000000;
+    do {
+        g_mutex_lock(&s->lock);
+        bool match = s->has_shown && s->shown.width == width && s->shown.height == height;
+        g_mutex_unlock(&s->lock);
+        if (match) {
+            printf("  PASS native frame size %ux%u\n", width, height);
+            return true;
+        }
+        g_usleep(5000);
+    } while (g_get_monotonic_time() < end);
+    printf("  FAIL native frame size %ux%u\n", width, height);
+    failures++;
+    return false;
+}
+
+static void viewport_regression(struct dmabuf_surface *surface) {
+    struct gview *v = gv_new(720, 600);
+    if (!v) { failures++; return; }
+    gv_load(v,
+        "<!doctype html><body style='margin:0;background:#0000ff'><script>"
+        "window.fixtureState=42;"
+        "addEventListener('resize',()=>{document.body.style.background="
+        "innerWidth===720&&innerHeight===178&&fixtureState===84?'#00ff00':"
+        "innerWidth===480&&innerHeight===420&&fixtureState===85?'#800080':'#ff0000'});"
+        "addEventListener('mousedown',e=>{if(e.clientX===200&&e.clientY===100&&fixtureState===84){"
+        "fixtureState=85;document.body.style.background='#00ffff'}else{document.body.style.background='#ff0000'}});"
+        "</script>");
+    wait_pixel(surface, 0x0000FF, 5000, "viewport initial page");
+    gv_js(v, "fixtureState=84;document.body.style.background='#ffff00'");
+    wait_pixel(surface, 0xFFFF00, 2000, "mutated state before resize");
+    if (webview_direct_resize(v->direct, 720, 178) != 0) failures++;
+    wait_size(surface, 720, 178);
+    wait_pixel(surface, 0x00FF00, 5000, "short viewport + state retained");
+    gv_send(v, gst_navigation_event_new_mouse_button_press(1, 200, 100, 0));
+    gv_send(v, gst_navigation_event_new_mouse_button_release(1, 200, 100, 0));
+    wait_pixel(surface, 0x00FFFF, 2000, "click uses resized coordinates");
+    if (webview_direct_resize(v->direct, 480, 420) != 0) failures++;
+    wait_size(surface, 480, 420);
+    wait_pixel(surface, 0x800080, 5000, "grown viewport + clicked state retained");
+    // Repeated resize while frames are outstanding, then close with work queued.
+    for (int i = 0; i < 20; i++) {
+        unsigned width = i % 2 ? 480 : 720, height = i % 2 ? 420 : 178;
+        if (webview_direct_resize(v->direct, width, height) != 0) failures++;
+        wait_size(surface, width, height);
+    }
+    webview_direct_resize(v->direct, 720, 178);
+    gv_free(v);
+    surface_clear(surface);
+}
+
 /* CPU time of this process and all its descendants, in seconds. */
 static double tree_cpu(void) {
     long hz = sysconf(_SC_CLK_TCK);
@@ -443,6 +496,14 @@ int main(int argc, char **argv) {
     g_gpu = gpu;
     g_surface = &surface;
     printf("backend: direct (WPEPlatform), pid=%d\n", getpid());
+
+    if (getenv("HARNESS_VIEWPORT_ONLY")) {
+        viewport_regression(&surface);
+        g_usleep(200000);
+        webview_gpu_unref(gpu);
+        printf("%s: viewport regression, %d failures\n", failures ? "FAILED" : "PASSED", failures);
+        return failures ? 2 : 0;
+    }
 
     printf("== functional (%dx%d)\n", w, h);
     struct gview *v;
