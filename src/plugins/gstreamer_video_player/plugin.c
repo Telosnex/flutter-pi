@@ -1362,13 +1362,15 @@ invalid_headers:
     if (getenv("FLUTTERPI_WEBVIEW_ON_PLANE") != NULL) {
         return platch_respond_success_std(
             responsehandle,
-            &STDMAP3(
+            &STDMAP4(
                 STDSTRING("textureId"),
                 STDINT64(gstplayer_get_texture_id(player)),
                 STDSTRING("platformViewId"),
                 STDINT64(gstplayer_get_platform_view_id(player)),
                 STDSTRING("pixelScroll"),
-                STDBOOL(gstplayer_supports_pixel_scroll(player))
+                STDBOOL(gstplayer_supports_pixel_scroll(player)),
+                STDSTRING("viewportResize"),
+                STDBOOL(gstplayer_supports_viewport_resize(player))
             )
         );
     }
@@ -1766,6 +1768,25 @@ static int on_web_load_url_v2(const struct raw_std_value *arg, FlutterPlatformMe
     return platch_respond_success_std(responsehandle, &STDNULL);
 }
 
+static int on_web_resize_v2(const struct raw_std_value *arg, FlutterPlatformMessageResponseHandle *responsehandle) {
+    int ok = check_arg_is_minimum_sized_list(arg, 3, responsehandle);
+    if (ok != 0) return 0;
+    struct gstplayer *player = get_player_from_v2_list_arg(arg, responsehandle);
+    if (player == NULL) return 0;
+    const struct raw_std_value *width = raw_std_list_get_nth_element(arg, 1);
+    const struct raw_std_value *height = raw_std_list_get_nth_element(arg, 2);
+    if (!raw_std_value_is_int(width) || !raw_std_value_is_int(height)) {
+        return platch_respond_illegal_arg_std(responsehandle, "Viewport dimensions must be integers.");
+    }
+    int64_t w = raw_std_value_as_int(width), h = raw_std_value_as_int(height);
+    if (w < 1 || w > 4096 || h < 1 || h > 4096) {
+        return platch_respond_illegal_arg_std(responsehandle, "Viewport dimensions must be 1..4096.");
+    }
+    ok = gstplayer_web_resize(player, (int) w, (int) h);
+    if (ok != 0) return platch_respond_native_error_std(responsehandle, ok);
+    return platch_respond_success_std(responsehandle, &STDNULL);
+}
+
 static int on_web_load_bytes_v2(const struct raw_std_value *arg, FlutterPlatformMessageResponseHandle *responsehandle) {
     const struct raw_std_value *bytes_value;
     struct gstplayer *player;
@@ -1919,6 +1940,8 @@ static int on_receive_method_channel_v2(char *channel, struct platch_obj *object
         return on_web_key_event_v2(arg, responsehandle);
     } else if (raw_std_string_equals(method, "webLoadUrl")) {
         return on_web_load_url_v2(arg, responsehandle);
+    } else if (raw_std_string_equals(method, "webResize")) {
+        return on_web_resize_v2(arg, responsehandle);
     } else if (raw_std_string_equals(method, "webLoadBytes")) {
         return on_web_load_bytes_v2(arg, responsehandle);
     } else if (raw_std_string_equals(method, "webRunJavaScript")) {

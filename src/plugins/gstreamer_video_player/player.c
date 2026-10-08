@@ -2001,6 +2001,15 @@ int gstplayer_web_load_bytes(struct gstplayer *player, const uint8_t *data, size
     return enqueue_web_task(player, task);
 }
 
+bool gstplayer_supports_viewport_resize(struct gstplayer *player) {
+    return player->webview_direct != NULL;
+}
+
+int gstplayer_web_resize(struct gstplayer *player, int width, int height) {
+    if (player->webview_direct == NULL) return ENOTSUP;
+    return webview_direct_resize(player->webview_direct, width, height);
+}
+
 int gstplayer_web_run_javascript(struct gstplayer *player, const char *source) {
     struct web_task *task;
     ASSERT_NOT_NULL(player);

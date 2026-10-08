@@ -49,11 +49,11 @@ struct webview_direct {
     struct webview_gpu *gpu;
     struct dmabuf_surface *surface;
     struct compositor *compositor;
-    int width, height;
     webview_direct_configure_cb configure;
     void *userdata;
 
-    // WebKit thread only.
+    // WebKit thread only after creation.
+    int width, height;
     WebKitWebView *web_view;
     WPEView *wpe_view;
     gint64 created_us, first_frame_us;
@@ -851,6 +851,38 @@ void webview_direct_destroy(struct webview_direct *view) {
 /* ------------------------------------------------------------------------- */
 /* Page control                                                              */
 /* ------------------------------------------------------------------------- */
+
+struct resize_task {
+    struct webview_direct *view;
+    int width, height;
+};
+
+static gboolean run_resize_task(void *userdata) {
+    struct resize_task *task = userdata;
+    struct webview_direct *view = task->view;
+    if (view->web_view == NULL) return G_SOURCE_REMOVE;
+    view->width = task->width;
+    view->height = task->height;
+    wpe_toplevel_resize(wpe_view_get_toplevel(view->wpe_view), view->width, view->height);
+    LOG_STATS("viewport resized to %dx%d (existing document).\n", view->width, view->height);
+    return G_SOURCE_REMOVE;
+}
+
+static void destroy_resize_task(void *userdata) {
+    struct resize_task *task = userdata;
+    view_unref(task->view);
+    g_free(task);
+}
+
+int webview_direct_resize(struct webview_direct *view, int width, int height) {
+    if (width < 1 || width > 4096 || height < 1 || height > 4096) return EINVAL;
+    struct resize_task *task = g_new0(struct resize_task, 1);
+    task->view = view_ref(view);
+    task->width = width;
+    task->height = height;
+    g_main_context_invoke_full(shared.context, G_PRIORITY_DEFAULT, run_resize_task, task, destroy_resize_task);
+    return 0;
+}
 
 enum page_task_type { kLoadUrl, kLoadBytes, kRunJavaScript };
 

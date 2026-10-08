@@ -123,6 +123,7 @@ void *gstplayer_get_userdata_locked(struct gstplayer *player);
 /// Get the id of the flutter external texture that this player is rendering into.
 int64_t gstplayer_get_texture_id(struct gstplayer *player);
 bool gstplayer_supports_pixel_scroll(struct gstplayer *player);
+bool gstplayer_supports_viewport_resize(struct gstplayer *player);
 
 int64_t gstplayer_get_platform_view_id(struct gstplayer *player);
 
@@ -190,6 +191,7 @@ int gstplayer_send_navigation_event(struct gstplayer *player, GstEvent *event);
 int gstplayer_web_load_url(struct gstplayer *player, const char *url);
 int gstplayer_web_load_bytes(struct gstplayer *player, const uint8_t *data, size_t size);
 int gstplayer_web_run_javascript(struct gstplayer *player, const char *source);
+int gstplayer_web_resize(struct gstplayer *player, int width, int height);
 int gstplayer_web_respond_to_handler(
     struct gstplayer *player,
     uint32_t call_id,
