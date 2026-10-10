@@ -99,6 +99,15 @@ struct gstplayer *gstplayer_new_from_file(struct flutterpi *flutterpi, const cha
 ///     @arg userdata  The userdata associated with this player.
 struct gstplayer *gstplayer_new_from_pipeline(struct flutterpi *flutterpi, const char *pipeline, void *userdata);
 
+/// Create a WPE WebKit web view. It renders on WPEPlatform, with no GStreamer
+/// pipeline, and is presented on a DRM overlay plane.
+///     @arg location  The first page to load.
+///     @arg width     Initial viewport width, 1..4096.
+///     @arg height    Initial viewport height, 1..4096.
+///     @arg userdata  The userdata associated with this player.
+///     @returns NULL when the GPU or the display plane is unavailable.
+struct gstplayer *gstplayer_new_web(struct flutterpi *flutterpi, const char *location, int width, int height, void *userdata);
+
 /// Destroy this gstreamer player instance and the resources
 /// associated with it. (texture, gstreamer pipeline, etc)
 ///
@@ -122,8 +131,6 @@ void *gstplayer_get_userdata_locked(struct gstplayer *player);
 
 /// Get the id of the flutter external texture that this player is rendering into.
 int64_t gstplayer_get_texture_id(struct gstplayer *player);
-bool gstplayer_supports_pixel_scroll(struct gstplayer *player);
-bool gstplayer_supports_viewport_resize(struct gstplayer *player);
 
 int64_t gstplayer_get_platform_view_id(struct gstplayer *player);
 
@@ -187,7 +194,8 @@ int gstplayer_step_backward(struct gstplayer *player);
 /// The event is consumed by this call regardless of success.
 int gstplayer_send_navigation_event(struct gstplayer *player, GstEvent *event);
 
-/// Runtime controls for a `wpevideosrc name=websrc` custom pipeline.
+/// Runtime controls for a web view from gstplayer_new_web(). Other players
+/// return EOPNOTSUPP.
 int gstplayer_web_load_url(struct gstplayer *player, const char *url);
 int gstplayer_web_load_bytes(struct gstplayer *player, const uint8_t *data, size_t size);
 int gstplayer_web_run_javascript(struct gstplayer *player, const char *source);

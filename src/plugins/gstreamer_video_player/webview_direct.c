@@ -648,7 +648,7 @@ static void *run_webkit_thread(void *userdata) {
         return NULL;
     }
 
-    // Runs for the life of the process, like wpevideosrc's WebKit thread.
+    // Runs for the life of the process.
     loop = g_main_loop_new(shared.context, FALSE);
     g_main_loop_run(loop);
     g_main_loop_unref(loop);
@@ -712,10 +712,6 @@ static void call_sync(GSourceFunc func, void *data) {
 /* ------------------------------------------------------------------------- */
 /* Creating and closing views                                                */
 /* ------------------------------------------------------------------------- */
-
-bool webview_direct_requested(void) {
-    return getenv("FLUTTERPI_WEBVIEW_DIRECT") != NULL;
-}
 
 struct create_args {
     struct webview_direct *view;
@@ -1121,62 +1117,4 @@ int webview_direct_send_navigation_event(struct webview_direct *view, GstEvent *
     task->event = event;
     g_main_context_invoke_full(shared.context, G_PRIORITY_DEFAULT, run_input_task, task, destroy_input_task);
     return 0;
-}
-
-/* ------------------------------------------------------------------------- */
-/* Pipeline description                                                      */
-/* ------------------------------------------------------------------------- */
-
-bool webview_direct_parse_pipeline(const char *description, char **location_out, int *width_out, int *height_out) {
-    const char *p, *caps_start;
-    GString *location;
-    GstCaps *caps;
-    GstStructure *structure;
-    char *caps_string;
-    int width = 0, height = 0;
-
-    if (description == NULL || !g_str_has_prefix(description, "wpevideosrc ")) return false;
-
-    // location="..." with \\ and \" escapes, as the Dart side writes it.
-    p = strstr(description, "location=\"");
-    if (p == NULL) return false;
-    p += strlen("location=\"");
-    location = g_string_new(NULL);
-    for (; *p != '\0' && *p != '"'; p++) {
-        if (*p == '\\' && (p[1] == '\\' || p[1] == '"')) p++;
-        g_string_append_c(location, *p);
-    }
-    if (*p != '"') {
-        g_string_free(location, TRUE);
-        return false;
-    }
-
-    // The caps between the first and second "!".
-    caps_start = strchr(p, '!');
-    if (caps_start == NULL) {
-        g_string_free(location, TRUE);
-        return false;
-    }
-    caps_start++;
-    {
-        const char *caps_end = strchr(caps_start, '!');
-        caps_string = caps_end != NULL ? g_strndup(caps_start, (gsize) (caps_end - caps_start)) : g_strdup(caps_start);
-    }
-    caps = gst_caps_from_string(g_strstrip(caps_string));
-    g_free(caps_string);
-    if (caps != NULL && gst_caps_get_size(caps) > 0) {
-        structure = gst_caps_get_structure(caps, 0);
-        gst_structure_get_int(structure, "width", &width);
-        gst_structure_get_int(structure, "height", &height);
-    }
-    if (caps != NULL) gst_caps_unref(caps);
-    if (width <= 0 || height <= 0) {
-        g_string_free(location, TRUE);
-        return false;
-    }
-
-    *location_out = g_string_free(location, FALSE);
-    *width_out = width;
-    *height_out = height;
-    return true;
 }
