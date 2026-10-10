@@ -9,7 +9,7 @@
  * holds can outlive a closed view, but their WPE objects are released only on
  * the WebKit thread. Closing a view does not forcibly terminate its process.
  *
- * Opt-in with FLUTTERPI_WEBVIEW_DIRECT=1; needs the plane and GPU paths too.
+ * This is the only web view backend; it needs the plane and the GPU copy.
  */
 #ifndef _FLUTTERPI_SRC_PLUGINS_GSTREAMER_VIDEO_PLAYER_WEBVIEW_DIRECT_H
 #define _FLUTTERPI_SRC_PLUGINS_GSTREAMER_VIDEO_PLAYER_WEBVIEW_DIRECT_H
@@ -29,13 +29,6 @@ struct webview_direct;
 
 /// Called on the WebKit thread with the new WebKitWebView, before the first load.
 typedef void (*webview_direct_configure_cb)(GObject *web_view, void *userdata);
-
-/// True when FLUTTERPI_WEBVIEW_DIRECT is set.
-bool webview_direct_requested(void);
-
-/// Reads location, width and height from the `wpevideosrc ... ! video/x-raw,...`
-/// description the Dart side builds. Returns false if it is not one.
-bool webview_direct_parse_pipeline(const char *description, char **location_out, int *width_out, int *height_out);
 
 /// Creates a view and starts loading @location. Blocks until the view exists.
 /// Borrows gpu, surface and compositor until destroy returns. After stopping

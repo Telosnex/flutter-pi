@@ -3,7 +3,6 @@
  * WPE webview frames that stay on the GPU. See webview_gpu.h.
  */
 #define _GNU_SOURCE
-#define GST_USE_UNSTABLE_API 1
 
 #include "plugins/gstreamer_video_player/webview_gpu.h"
 
@@ -19,12 +18,7 @@
 
 #include <drm_fourcc.h>
 #include <gbm.h>
-#include <gst/gl/egl/gstgldisplay_egl.h>
-#include <gst/gl/egl/gsteglimage.h>
-#include <gst/gl/gl.h>
-#include <gst/video/video.h>
 #include <pthread.h>
-#include <wpe/webkit.h>
 
 #include "dmabuf_surface.h"
 #include "egl.h"
@@ -47,12 +41,7 @@
 typedef EGLDisplay (*wg_get_platform_display_t)(EGLenum platform, void *native_display, const EGLint *attribs);
 typedef void *(*wg_create_image_t)(EGLDisplay dpy, EGLContext ctx, EGLenum target, EGLClientBuffer buffer, const EGLint *attribs);
 typedef EGLBoolean (*wg_destroy_image_t)(EGLDisplay dpy, void *image);
-typedef EGLBoolean (*wg_export_query_t)(EGLDisplay dpy, void *image, int *fourcc, int *num_planes, uint64_t *modifiers);
-typedef EGLBoolean (*wg_export_t)(EGLDisplay dpy, void *image, int *fds, EGLint *strides, EGLint *offsets);
 typedef void (*wg_image_target_texture_t)(GLenum target, void *image);
-
-/// Quark wpevideosrc uses to attach its GstEGLImage to each GL memory.
-#define WPE_EGL_IMAGE_QUARK "GstWPEEGLImage"
 
 /// Scanout buffers in rotation: one on screen, one queued, one being drawn.
 // One slot on screen, one in a pending page flip, one queued as the
@@ -96,8 +85,6 @@ struct webview_gpu {
 
     wg_create_image_t create_image;
     wg_destroy_image_t destroy_image;
-    wg_export_query_t export_query;
-    wg_export_t export_image;
     wg_image_target_texture_t image_target_texture;
 
     bool gl_ready;
@@ -143,10 +130,6 @@ static void webview_gpu_unref_internal(struct webview_gpu *gpu) {
     if (!refcount_dec(&gpu->n_refs)) {
         webview_gpu_destroy(gpu);
     }
-}
-
-bool webview_gpu_requested(void) {
-    return getenv("FLUTTERPI_WEBVIEW_GPU") != NULL;
 }
 
 static bool has_extension(const char *extensions, const char *name) {
@@ -198,7 +181,6 @@ struct webview_gpu *webview_gpu_new(struct gbm_device *gbm_device) {
     const char *required[] = {
         "EGL_EXT_image_dma_buf_import",
         "EGL_EXT_image_dma_buf_import_modifiers",
-        "EGL_MESA_image_dma_buf_export",
         "EGL_KHR_surfaceless_context",
         "EGL_KHR_no_config_context",
     };
@@ -221,10 +203,8 @@ struct webview_gpu *webview_gpu_new(struct gbm_device *gbm_device) {
 
     gpu->create_image = (wg_create_image_t) eglGetProcAddress("eglCreateImageKHR");
     gpu->destroy_image = (wg_destroy_image_t) eglGetProcAddress("eglDestroyImageKHR");
-    gpu->export_query = (wg_export_query_t) eglGetProcAddress("eglExportDMABUFImageQueryMESA");
-    gpu->export_image = (wg_export_t) eglGetProcAddress("eglExportDMABUFImageMESA");
     gpu->image_target_texture = (wg_image_target_texture_t) eglGetProcAddress("glEGLImageTargetTexture2DOES");
-    if (!gpu->create_image || !gpu->destroy_image || !gpu->export_query || !gpu->export_image || !gpu->image_target_texture) {
+    if (!gpu->create_image || !gpu->destroy_image || !gpu->image_target_texture) {
         LOG_ERROR("webview GPU frames: missing EGL image entry points.\n");
         goto fail_destroy_context;
     }
@@ -314,114 +294,6 @@ static void webview_gpu_destroy(struct webview_gpu *gpu) {
         (double) gpu->copy_ns_max / 1e6
     );
     free(gpu);
-}
-
-int webview_gpu_configure_pipeline(struct webview_gpu *gpu, GstElement *pipeline, GstElement *websrc) {
-    GstGLDisplayEGL *gl_display;
-    GstContext *context;
-    GstPad *src_pad, *peer;
-    GstElement *filter;
-    GstCaps *caps, *gl_caps;
-
-    // One EGL display for WebKit's frames and for this module's copies, so
-    // wpevideosrc's EGLImages are valid here without a dmabuf round trip, and
-    // GStreamer does not open a second DRM device of its own.
-    gl_display = gst_gl_display_egl_new_with_egl_display(gpu->display);
-    if (gl_display == NULL) {
-        LOG_ERROR("webview GPU frames: could not wrap the EGL display for GStreamer.\n");
-        return EIO;
-    }
-    context = gst_context_new(GST_GL_DISPLAY_CONTEXT_TYPE, TRUE);
-    gst_context_set_gl_display(context, GST_GL_DISPLAY(gl_display));
-    gst_element_set_context(pipeline, context);
-    gst_context_unref(context);
-    gst_object_unref(gl_display);
-
-    // The app describes the pipeline with system-memory caps. Keep its size and
-    // rate, and only change the memory type and format.
-    src_pad = gst_element_get_static_pad(websrc, "src");
-    peer = src_pad != NULL ? gst_pad_get_peer(src_pad) : NULL;
-    filter = peer != NULL ? gst_pad_get_parent_element(peer) : NULL;
-    if (src_pad) gst_object_unref(src_pad);
-    if (peer) gst_object_unref(peer);
-
-    if (filter == NULL || g_object_class_find_property(G_OBJECT_GET_CLASS(filter), "caps") == NULL) {
-        LOG_ERROR("webview GPU frames: \"websrc\" must link to a capsfilter.\n");
-        if (filter) gst_object_unref(filter);
-        return EINVAL;
-    }
-
-    g_object_get(filter, "caps", &caps, NULL);
-    gl_caps = gst_caps_new_empty();
-    for (guint i = 0; caps != NULL && i < gst_caps_get_size(caps); i++) {
-        GstStructure *s = gst_structure_copy(gst_caps_get_structure(caps, i));
-        gst_structure_set(s, "format", G_TYPE_STRING, "RGBA", NULL);
-        gst_caps_append_structure_full(gl_caps, s, gst_caps_features_new(GST_CAPS_FEATURE_MEMORY_GL_MEMORY, NULL));
-    }
-    if (caps == NULL || gst_caps_is_empty(gl_caps)) {
-        gst_caps_append_structure_full(
-            gl_caps,
-            gst_structure_new("video/x-raw", "format", G_TYPE_STRING, "RGBA", NULL),
-            gst_caps_features_new(GST_CAPS_FEATURE_MEMORY_GL_MEMORY, NULL)
-        );
-    }
-    g_object_set(filter, "caps", gl_caps, NULL);
-    {
-        gchar *s = gst_caps_to_string(gl_caps);
-        LOG_ERROR_UNPREFIXED("webview GPU frames: websrc caps %s\n", s);
-        g_free(s);
-    }
-    if (caps) gst_caps_unref(caps);
-    gst_caps_unref(gl_caps);
-    gst_object_unref(filter);
-    return 0;
-}
-
-GstCaps *webview_gpu_appsink_caps(void) {
-    GstCaps *caps = gst_caps_new_empty();
-    gst_caps_append_structure_full(
-        caps,
-        gst_structure_new("video/x-raw", "format", G_TYPE_STRING, "RGBA", NULL),
-        gst_caps_features_new(GST_CAPS_FEATURE_MEMORY_GL_MEMORY, NULL)
-    );
-    return caps;
-}
-
-void webview_gpu_configure_web_view(GObject *object) {
-    WebKitWebView *webview = WEBKIT_WEB_VIEW(object);
-    WebKitSettings *settings = webkit_web_view_get_settings(webview);
-    WebKitFeatureList *features = webkit_settings_get_all_features();
-
-    // WPE 2.54 repaints only the damaged region of each frame, but tracks one
-    // render target while WPEBackend-fdo rotates several EGL buffers. The other
-    // buffers keep stale or never-painted (black) regions. The system-memory
-    // path is not affected. Full repaints cost GPU time only.
-    for (gsize i = 0; i < webkit_feature_list_get_length(features); i++) {
-        WebKitFeature *feature = webkit_feature_list_get(features, i);
-        const char *id = webkit_feature_get_identifier(feature);
-        if (strcmp(id, "PropagateDamagingInformation") == 0 || strcmp(id, "UseDamagingInformationForCompositing") == 0) {
-            webkit_settings_set_feature_enabled(settings, feature, FALSE);
-        }
-    }
-    webkit_feature_list_unref(features);
-}
-
-static GstEGLImage *sample_image(GstSample *sample, GstMemory **memory_out) {
-    GstBuffer *buffer = gst_sample_get_buffer(sample);
-    GstMemory *memory;
-
-    if (buffer == NULL || gst_buffer_n_memory(buffer) < 1) {
-        return NULL;
-    }
-    memory = gst_buffer_peek_memory(buffer, 0);
-    if (memory_out != NULL) {
-        *memory_out = memory;
-    }
-    return gst_mini_object_get_qdata(GST_MINI_OBJECT_CAST(memory), g_quark_from_static_string(WPE_EGL_IMAGE_QUARK));
-}
-
-bool webview_gpu_sample_has_image(GstSample *sample) {
-    return sample_image(sample, NULL) != NULL;
 }
 
 static const char *kVertexShader =
@@ -565,54 +437,6 @@ static bool ensure_slot(struct webview_gpu *gpu, struct slot *slot, int width, i
     return true;
 }
 
-/// Returns a texture for the source frame. Same-display EGLImages bind
-/// directly. Otherwise the image is exported and imported again, cached per
-/// WebKit buffer, since WebKit reuses a few buffers.
-static GLuint dmabuf_texture(struct webview_gpu *gpu, const struct webview_gpu_source *src);
-
-static GLuint source_texture(struct webview_gpu *gpu, GstEGLImage *gst_image, int width, int height) {
-    GstGLContext *gl_context = gst_image->context;
-    EGLDisplay source_display = EGL_NO_DISPLAY;
-    void *image = gst_egl_image_get_image(gst_image);
-    int fourcc = 0, n_planes = 0, fd = -1;
-    uint64_t modifier = DRM_FORMAT_MOD_INVALID;
-    EGLint stride = 0, offset = 0;
-    GLuint texture;
-
-    if (gl_context != NULL) {
-        GstGLDisplayEGL *egl = gst_gl_display_egl_from_gl_display(gl_context->display);
-        if (egl != NULL) {
-            source_display = (EGLDisplay) gst_gl_display_get_handle(GST_GL_DISPLAY(egl));
-            gst_object_unref(egl);
-        }
-    }
-
-    if (source_display == EGL_NO_DISPLAY) {
-        return 0;
-    }
-
-    if (!gpu->export_query(source_display, image, &fourcc, &n_planes, &modifier) || n_planes != 1 ||
-        !gpu->export_image(source_display, image, &fd, &stride, &offset)) {
-        LOG_ERROR("webview GPU frames: could not export the WebKit frame (0x%x).\n", eglGetError());
-        return 0;
-    }
-
-    texture = dmabuf_texture(
-        gpu,
-        &(struct webview_gpu_source){
-            .width = width,
-            .height = height,
-            .fourcc = (uint32_t) fourcc,
-            .fd = fd,
-            .stride = (uint32_t) stride,
-            .offset = (uint32_t) offset,
-            .modifier = modifier,
-        }
-    );
-    close(fd);
-    return texture;
-}
-
 /// Imports a single-plane DMA-BUF as a texture, cached by the buffer's inode.
 /// Does not take ownership of @src->fd.
 static GLuint dmabuf_texture(struct webview_gpu *gpu, const struct webview_gpu_source *src) {
@@ -676,7 +500,6 @@ static int copy_common(
     struct webview_gpu *gpu,
     int width,
     int height,
-    GstEGLImage *gst_image,
     const struct webview_gpu_source *src,
     struct dmabuf *dmabuf_out
 ) {
@@ -727,7 +550,7 @@ static int copy_common(
         ok = EIO;
         goto out_release;
     }
-    texture = gst_image != NULL ? source_texture(gpu, gst_image, width, height) : dmabuf_texture(gpu, src);
+    texture = dmabuf_texture(gpu, src);
     if (texture == 0) {
         ok = EIO;
         goto out_release;
@@ -824,30 +647,11 @@ out_unlock:
     return ok;
 }
 
-int webview_gpu_copy_sample(struct webview_gpu *gpu, GstSample *sample, struct dmabuf *dmabuf_out) {
-    GstEGLImage *gst_image = sample_image(sample, NULL);
-    GstVideoInfo info;
-
-    if (gst_image == NULL || !gst_video_info_from_caps(&info, gst_sample_get_caps(sample))) {
-        return EINVAL;
-    }
-    return copy_common(gpu, GST_VIDEO_INFO_WIDTH(&info), GST_VIDEO_INFO_HEIGHT(&info), gst_image, NULL, dmabuf_out);
-}
-
 int webview_gpu_copy_dmabuf(struct webview_gpu *gpu, const struct webview_gpu_source *src, struct dmabuf *dmabuf_out) {
     if (src == NULL || src->fd < 0 || src->width <= 0 || src->height <= 0) {
         return EINVAL;
     }
-    return copy_common(gpu, src->width, src->height, NULL, src, dmabuf_out);
-}
-
-void webview_gpu_release_sample(GstSample *sample) {
-    GstMemory *memory = NULL;
-    if (sample_image(sample, &memory) != NULL) {
-        // Release even dropped/failed copies. Otherwise pooled memory can keep
-        // the image until after the WPE view is destroyed and crash on close.
-        gst_mini_object_set_qdata(GST_MINI_OBJECT_CAST(memory), g_quark_from_static_string(WPE_EGL_IMAGE_QUARK), NULL, NULL);
-    }
+    return copy_common(gpu, src->width, src->height, src, dmabuf_out);
 }
 
 void webview_gpu_release_dmabuf(struct dmabuf *dmabuf) {

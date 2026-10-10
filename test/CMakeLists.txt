@@ -88,7 +88,7 @@ target_sources(surface_lifecycle_test PRIVATE
     ${PROJECT_SOURCE_DIR}/src/compositor_ng.c
 )
 
-if(WPEWEBKIT_FOUND AND LIBGSTREAMER_GL_FOUND)
+if(WPEWEBKIT_FOUND)
     add_executable(webview_completion_test
         webview_completion_test.c
         ${PROJECT_SOURCE_DIR}/src/plugins/gstreamer_video_player/webview_gpu.c

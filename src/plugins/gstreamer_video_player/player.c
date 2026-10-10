@@ -181,8 +181,9 @@ struct gstplayer {
     struct texture *texture;
     int64_t texture_id;
 
-    /// Set when FLUTTERPI_WEBVIEW_ON_PLANE is in the environment: frames go to a
-    /// DRM overlay plane via this surface instead of being uploaded as a texture.
+    /// Always set for web views. For media players, set when
+    /// FLUTTERPI_WEBVIEW_ON_PLANE is in the environment: frames go to a DRM
+    /// overlay plane via this surface instead of being uploaded as a texture.
     /// Renderer-agnostic, so it survives under Vulkan where external textures do not.
     struct dmabuf_surface *dmabuf_surface;
     int64_t platform_view_id;
@@ -191,32 +192,29 @@ struct gstplayer {
     /// Keeps the texture path alive as a fallback, and says so out loud.
     int plane_frames_without_present;
 
-    /// Set when FLUTTERPI_WEBVIEW_GPU is also set: WebKit renders with the GPU,
-    /// and frames are copied GPU to GPU into scanout buffers. NULL otherwise.
+    /// Web views only: the GPU copy used when a WebKit buffer cannot be
+    /// scanned out as is.
     struct webview_gpu *webview_gpu;
 
-    /// Set when FLUTTERPI_WEBVIEW_DIRECT is also set and the description is a
-    /// wpevideosrc webview: WebKit runs on WPEPlatform with no pipeline, and
-    /// player->pipeline stays NULL.
+    /// Web views only: WebKit runs on WPEPlatform with no GStreamer pipeline,
+    /// and player->pipeline stays NULL.
     struct webview_direct *webview_direct;
+
+    /// Web views only: the first page and the initial viewport size.
+    char *web_location;
+    int web_width, web_height;
 
     struct frame_interface *frame_interface;
 
-    GstElement *pipeline, *sink, *websrc;
+    GstElement *pipeline, *sink;
     GstBus *bus;
 
     GMutex web_lock;
     GHashTable *pending_web_replies;
-    GAsyncQueue *web_tasks;
-    GThread *web_thread;
-    atomic_bool web_move_pending;
     uint32_t next_web_call_id;
     sd_event_source *busfd_events;
 
     bool is_live;
-
-    /// True while webview_direct_new() runs, so on_configure_web_view knows.
-    bool creating_direct;
 };
 
 struct pending_web_reply {
@@ -231,89 +229,7 @@ struct web_reply_task {
     char *error;
 };
 
-enum web_task_type {
-    kWebTaskStop,
-    kWebTaskNavigation,
-    kWebTaskLoadUrl,
-    kWebTaskLoadBytes,
-    kWebTaskRunJavaScript,
-};
-
-enum web_pointer_task_kind {
-    kWebPointerTaskNone,
-    kWebPointerTaskMove,
-};
-
-struct web_task {
-    enum web_task_type type;
-    enum web_pointer_task_kind pointer_kind;
-    GstEvent *navigation_event;
-    GBytes *bytes;
-    char *string;
-};
-
 static gboolean complete_web_reply(void *userdata);
-
-static void destroy_web_task(void *userdata) {
-    struct web_task *task = userdata;
-    if (task == NULL) return;
-    if (task->navigation_event != NULL) gst_event_unref(task->navigation_event);
-    if (task->bytes != NULL) g_bytes_unref(task->bytes);
-    free(task->string);
-    free(task);
-}
-
-static void *run_web_tasks(void *userdata) {
-    struct gstplayer *player = userdata;
-    struct web_task *task;
-
-    for (;;) {
-        task = g_async_queue_pop(player->web_tasks);
-        if (task->type == kWebTaskStop) {
-            destroy_web_task(task);
-            break;
-        }
-
-        switch (task->type) {
-            case kWebTaskNavigation:
-                {
-                    GstNavigationEventType navigation_type = gst_navigation_event_get_type(task->navigation_event);
-                    if (!gst_element_send_event(player->pipeline, task->navigation_event)) {
-                        LOG_ERROR("Could not send navigation event (type %d) upstream through the GStreamer pipeline.\n", (int) navigation_type);
-                    }
-                }
-                // gst_element_send_event consumes the event even on failure.
-                task->navigation_event = NULL;
-                if (task->pointer_kind == kWebPointerTaskMove) {
-                    player->web_move_pending = false;
-                }
-                break;
-            case kWebTaskLoadUrl:
-                g_object_set(G_OBJECT(player->websrc), "location", task->string, NULL);
-                break;
-            case kWebTaskLoadBytes:
-                g_signal_emit_by_name(player->websrc, "load-bytes", task->bytes);
-                break;
-            case kWebTaskRunJavaScript:
-                g_signal_emit_by_name(player->websrc, "run-javascript", task->string);
-                break;
-            case kWebTaskStop: UNREACHABLE();
-        }
-        destroy_web_task(task);
-    }
-    return NULL;
-}
-
-static int enqueue_web_task(struct gstplayer *player, struct web_task *task) {
-    ASSERT_NOT_NULL(player);
-    ASSERT_NOT_NULL(task);
-    if (player->websrc == NULL || player->web_thread == NULL) {
-        destroy_web_task(task);
-        return EOPNOTSUPP;
-    }
-    g_async_queue_push(player->web_tasks, task);
-    return 0;
-}
 
 static const char kWebBridgeScript[] =
     "(() => {"
@@ -458,21 +374,17 @@ static gboolean on_web_handler_call(
     return TRUE;
 }
 
-static void on_configure_web_view(GstElement *websrc, GObject *object, void *userdata) {
+/// Called on the WebKit thread with each new view, before its first load.
+static void on_configure_web_view(GObject *object, void *userdata) {
     struct gstplayer *player = userdata;
     WebKitUserContentManager *manager;
     WebKitUserScript *script;
     WebKitWebView *webview = WEBKIT_WEB_VIEW(object);
-    (void) websrc;
 
     manager = webkit_web_view_get_user_content_manager(webview);
     if (manager == NULL) {
         LOG_ERROR("Could not get the WPE WebKit user content manager.\n");
         return;
-    }
-
-    if (player->webview_gpu != NULL && player->webview_direct == NULL && !player->creating_direct) {
-        webview_gpu_configure_web_view(object);
     }
 
     g_signal_connect(webview, "load-changed", G_CALLBACK(on_web_load_changed), player);
@@ -1181,29 +1093,6 @@ static GstFlowReturn on_appsink_new_sample(GstAppSink *appsink, void *userdata) 
         return GST_FLOW_FLUSHING;
     }
 
-    if (player->webview_gpu != NULL && webview_gpu_sample_has_image(sample)) {
-        struct dmabuf dmabuf;
-        int ok;
-
-        // GL frames have no texture fallback: frame_new() only takes system or
-        // dmabuf memory. The plane is the only consumer.
-        ok = webview_gpu_copy_sample(player->webview_gpu, sample, &dmabuf);
-        webview_gpu_release_sample(sample);
-        gst_sample_unref(sample);
-        if (ok == 0) {
-            ok = dmabuf_surface_push_dmabuf(player->dmabuf_surface, &dmabuf, webview_gpu_release_dmabuf);
-            if (ok != 0) {
-                webview_gpu_release_dmabuf(&dmabuf);
-            }
-        } else if (ok != EAGAIN) {
-            LOG_ERROR("Could not copy the webview frame on the GPU: %s\n", strerror(ok));
-        }
-        if (!dmabuf_surface_was_presented(player->dmabuf_surface) && ++player->plane_frames_without_present == 120) {
-            LOG_ERROR("Platform view still not presented after 120 GPU frames. Nothing is compositing it.\n");
-        }
-        return GST_FLOW_OK;
-    }
-
     if (player->dmabuf_surface != NULL) {
         struct dmabuf dmabuf;
         int ok;
@@ -1275,38 +1164,22 @@ void on_source_setup(GstElement *bin, GstElement *source, gpointer userdata) {
     }
 }
 
-static void on_configure_direct_web_view(GObject *web_view, void *userdata) {
-    on_configure_web_view(NULL, web_view, userdata);
-}
+/// Starts the web view on WPEPlatform. There is no other web view backend.
+static int init_web(struct gstplayer *player) {
+    int width = player->web_width, height = player->web_height;
 
-/// FLUTTERPI_WEBVIEW_DIRECT: run a wpevideosrc description on WPEPlatform.
-/// Returns ENOTSUP when this description or setup does not qualify.
-static int init_direct(struct gstplayer *player) {
-    char *location = NULL;
-    int width, height;
-
-    if (!webview_direct_requested() || player->webview_gpu == NULL || player->dmabuf_surface == NULL ||
-        !webview_direct_parse_pipeline(player->pipeline_description, &location, &width, &height)) {
-        return ENOTSUP;
-    }
-
-    player->creating_direct = true;
     player->webview_direct = webview_direct_new(
         player->webview_gpu,
         player->dmabuf_surface,
         flutterpi_get_compositor(player->flutterpi),
         width,
         height,
-        location,
-        on_configure_direct_web_view,
+        player->web_location,
+        on_configure_web_view,
         player
     );
-    player->creating_direct = false;
-    g_free(location);
     if (player->webview_direct == NULL) {
-        // No fallback to wpevideosrc: WebKit may already be running on the
-        // direct path's thread, and it must not start on a second one.
-        LOG_ERROR("Could not create the direct WPE webview.\n");
+        LOG_ERROR("Could not create the WPE web view.\n");
         return EIO;
     }
 
@@ -1322,14 +1195,14 @@ static int init_direct(struct gstplayer *player) {
     player->info.info.seek_end_ms = 0;
     player->info.has_resolution = player->info.has_fps = player->info.has_duration = player->info.has_seeking_info = true;
     maybe_send_info(player);
-    LOG_DEBUG("Created direct WPE webview %dx%d.\n", width, height);
+    LOG_DEBUG("Created WPE web view %dx%d.\n", width, height);
     return 0;
 }
 
 static int init(struct gstplayer *player, bool force_sw_decoders) {
     GstStateChangeReturn state_change_return;
     sd_event_source *busfd_event_source;
-    GstElement *pipeline, *sink, *src, *websrc;
+    GstElement *pipeline, *sink, *src;
     GstBus *bus;
     GstPad *pad;
     GPollFD fd;
@@ -1338,9 +1211,8 @@ static int init(struct gstplayer *player, bool force_sw_decoders) {
 
     static const char *default_pipeline_descr = "uridecodebin name=\"src\" ! video/x-raw ! appsink sync=true name=\"sink\"";
 
-    if (player->pipeline_description != NULL) {
-        ok = init_direct(player);
-        if (ok != ENOTSUP) return ok;
+    if (player->web_location != NULL) {
+        return init_web(player);
     }
 
     const char *pipeline_descr;
@@ -1373,25 +1245,6 @@ static int init(struct gstplayer *player, bool force_sw_decoders) {
     gst_pad_add_probe(pad, GST_PAD_PROBE_TYPE_QUERY_DOWNSTREAM, on_query_appsink, player, NULL);
 
     src = gst_bin_get_by_name(GST_BIN(pipeline), "src");
-    websrc = gst_bin_get_by_name(GST_BIN(pipeline), "websrc");
-    if (websrc != NULL) {
-        if (g_signal_lookup("configure-web-view", G_OBJECT_TYPE(websrc)) == 0) {
-            LOG_ERROR("The element named \"websrc\" is not a configurable WPE video source.\n");
-            gst_object_unref(websrc);
-            websrc = NULL;
-        } else {
-            g_signal_connect(websrc, "configure-web-view", G_CALLBACK(on_configure_web_view), player);
-        }
-    }
-
-    if (player->webview_gpu != NULL && (websrc == NULL || webview_gpu_configure_pipeline(player->webview_gpu, pipeline, websrc) != 0)) {
-        if (websrc != NULL) {
-            LOG_ERROR("Could not set up webview GPU frames. Using system-memory frames.\n");
-        }
-        webview_gpu_unref(player->webview_gpu);
-        player->webview_gpu = NULL;
-    }
-
     if (player->video_uri != NULL) {
         if (src != NULL) {
             g_object_set(G_OBJECT(src), "uri", player->video_uri, NULL);
@@ -1429,9 +1282,7 @@ static int init(struct gstplayer *player, bool force_sw_decoders) {
     // configure our caps
     // we only accept video formats that we can actually upload to EGL
     GstCaps *caps = gst_caps_new_empty();
-    if (player->webview_gpu != NULL) {
-        gst_caps_append(caps, webview_gpu_appsink_caps());
-    } else if (player->frame_interface == NULL) {
+    if (player->frame_interface == NULL) {
         // Plane path: no EGL import, frames are copied into an ARGB8888
         // scanout BO, so accept the packed 32-bit formats WPE produces.
         gst_caps_append(caps, gst_caps_new_simple("video/x-raw", "format", G_TYPE_STRING, "BGRA", NULL));
@@ -1488,15 +1339,11 @@ static int init(struct gstplayer *player, bool force_sw_decoders) {
     }
 
     player->sink = sink;
-    player->websrc = websrc;
     /// FIXME: Not sure we need this here. pipeline is floating after gst_parse_launch, which
     /// means we should take a reference, but the examples don't increase the refcount.
     player->pipeline = pipeline;  //gst_object_ref(pipeline);
     player->bus = bus;
     player->busfd_events = busfd_event_source;
-    if (websrc != NULL) {
-        player->web_thread = g_thread_new("flutterpi-wpe", run_web_tasks, player);
-    }
 
     gst_object_unref(pad);
     return 0;
@@ -1517,13 +1364,6 @@ static void maybe_deinit(struct gstplayer *player) {
         webview_direct_destroy(player->webview_direct);
         player->webview_direct = NULL;
     }
-    if (player->web_thread != NULL) {
-        struct web_task *stop = g_new0(struct web_task, 1);
-        stop->type = kWebTaskStop;
-        g_async_queue_push(player->web_tasks, stop);
-        g_thread_join(player->web_thread);
-        player->web_thread = NULL;
-    }
     if (player->busfd_events != NULL) {
         sd_event_source_unrefp(&player->busfd_events);
     }
@@ -1541,15 +1381,19 @@ static void maybe_deinit(struct gstplayer *player) {
         gst_object_unref(GST_OBJECT(player->pipeline));
         player->pipeline = NULL;
     }
-    if (player->websrc != NULL) {
-        gst_object_unref(GST_OBJECT(player->websrc));
-        player->websrc = NULL;
-    }
 }
 
 DEFINE_LOCK_OPS(gstplayer, lock)
 
-static struct gstplayer *gstplayer_new(struct flutterpi *flutterpi, const char *uri, const char *pipeline_descr, void *userdata) {
+static struct gstplayer *gstplayer_new(
+    struct flutterpi *flutterpi,
+    const char *uri,
+    const char *pipeline_descr,
+    const char *web_location,
+    int web_width,
+    int web_height,
+    void *userdata
+) {
     struct frame_interface *frame_interface;
     struct gstplayer *player;
     struct texture *texture;
@@ -1559,7 +1403,7 @@ static struct gstplayer *gstplayer_new(struct flutterpi *flutterpi, const char *
     int ok;
 
     ASSERT_NOT_NULL(flutterpi);
-    assert((uri != NULL) != (pipeline_descr != NULL));
+    assert((uri != NULL) + (pipeline_descr != NULL) + (web_location != NULL) == 1);
 
     player = malloc(sizeof *player);
     if (player == NULL)
@@ -1573,7 +1417,7 @@ static struct gstplayer *gstplayer_new(struct flutterpi *flutterpi, const char *
     // frame interface is only fatal for the texture path. Under Vulkan there is no
     // gl_renderer at all, and bailing here is what made the webview disappear.
     frame_interface = frame_interface_new(flutterpi_get_gl_renderer(flutterpi));
-    if (frame_interface == NULL && getenv("FLUTTERPI_WEBVIEW_ON_PLANE") == NULL)
+    if (frame_interface == NULL && web_location == NULL && getenv("FLUTTERPI_WEBVIEW_ON_PLANE") == NULL)
         goto fail_destroy_texture;
 
     texture_id = texture_get_id(texture);
@@ -1620,9 +1464,6 @@ static struct gstplayer *gstplayer_new(struct flutterpi *flutterpi, const char *
     player->pending_web_replies = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, destroy_pending_web_reply);
     if (player->pending_web_replies == NULL)
         goto fail_deinit_web_resources;
-    player->web_tasks = g_async_queue_new_full(destroy_web_task);
-    if (player->web_tasks == NULL)
-        goto fail_unref_pending_web_replies;
 
     player->flutterpi = flutterpi;
     player->userdata = userdata;
@@ -1650,22 +1491,22 @@ static struct gstplayer *gstplayer_new(struct flutterpi *flutterpi, const char *
     player->frame_interface = frame_interface;
     player->pipeline = NULL;
     player->sink = NULL;
-    player->websrc = NULL;
     player->bus = NULL;
-    player->web_thread = NULL;
-    player->web_move_pending = false;
     player->next_web_call_id = 1;
     player->busfd_events = NULL;
     player->is_live = false;
-    // Opt-in: present frames on a DRM overlay plane instead of uploading them as a
-    // texture. Renderer-agnostic, so this is what survives under Vulkan.
     player->dmabuf_surface = NULL;
     player->platform_view_id = 0;
     player->plane_frames_without_present = 0;
     player->webview_gpu = NULL;
     player->webview_direct = NULL;
-    player->creating_direct = false;
-    if (getenv("FLUTTERPI_WEBVIEW_ON_PLANE") != NULL) {
+    player->web_location = NULL;
+    player->web_width = web_width;
+    player->web_height = web_height;
+    // Web views always present on a DRM overlay plane. Media players do so
+    // only on request; the plane is renderer-agnostic, so it survives under
+    // Vulkan where external textures do not.
+    if (web_location != NULL || getenv("FLUTTERPI_WEBVIEW_ON_PLANE") != NULL) {
         player->dmabuf_surface = dmabuf_surface_new(
             flutterpi_get_tracer(player->flutterpi),
             flutterpi_get_texture_registry(player->flutterpi)
@@ -1677,16 +1518,23 @@ static struct gstplayer *gstplayer_new(struct flutterpi *flutterpi, const char *
                 player->platform_view_id,
                 CAST_SURFACE_UNCHECKED(player->dmabuf_surface)
             );
-            if (webview_gpu_requested()) {
-                player->webview_gpu = webview_gpu_new(flutterpi_get_gbm_device(player->flutterpi));
-            }
+        }
+    }
+    if (web_location != NULL) {
+        // No fallback: a web view needs the plane and the GPU copy.
+        player->web_location = strdup(web_location);
+        if (player->dmabuf_surface == NULL) {
+            LOG_ERROR("Could not create the WPE web view's display surface.\n");
+        } else {
+            player->webview_gpu = webview_gpu_new(flutterpi_get_gbm_device(player->flutterpi));
+        }
+        if (player->web_location == NULL || player->webview_gpu == NULL) {
+            gstplayer_destroy(player);
+            return NULL;
         }
     }
 
     return player;
-
-fail_unref_pending_web_replies:
-    g_hash_table_unref(player->pending_web_replies);
 
 fail_deinit_web_resources:
     g_mutex_clear(&player->web_lock);
@@ -1734,7 +1582,7 @@ struct gstplayer *gstplayer_new_from_asset(struct flutterpi *flutterpi, const ch
         return NULL;
     }
 
-    player = gstplayer_new(flutterpi, uri, NULL, userdata);
+    player = gstplayer_new(flutterpi, uri, NULL, NULL, 0, 0, userdata);
 
     free(uri);
 
@@ -1743,19 +1591,25 @@ struct gstplayer *gstplayer_new_from_asset(struct flutterpi *flutterpi, const ch
 
 struct gstplayer *gstplayer_new_from_network(struct flutterpi *flutterpi, const char *uri, enum format_hint format_hint, void *userdata) {
     (void) format_hint;
-    return gstplayer_new(flutterpi, uri, NULL, userdata);
+    return gstplayer_new(flutterpi, uri, NULL, NULL, 0, 0, userdata);
 }
 
 struct gstplayer *gstplayer_new_from_file(struct flutterpi *flutterpi, const char *uri, void *userdata) {
-    return gstplayer_new(flutterpi, uri, NULL, userdata);
+    return gstplayer_new(flutterpi, uri, NULL, NULL, 0, 0, userdata);
 }
 
 struct gstplayer *gstplayer_new_from_content_uri(struct flutterpi *flutterpi, const char *uri, void *userdata) {
-    return gstplayer_new(flutterpi, uri, NULL, userdata);
+    return gstplayer_new(flutterpi, uri, NULL, NULL, 0, 0, userdata);
 }
 
 struct gstplayer *gstplayer_new_from_pipeline(struct flutterpi *flutterpi, const char *pipeline, void *userdata) {
-    return gstplayer_new(flutterpi, NULL, pipeline, userdata);
+    return gstplayer_new(flutterpi, NULL, pipeline, NULL, 0, 0, userdata);
+}
+
+struct gstplayer *gstplayer_new_web(struct flutterpi *flutterpi, const char *location, int width, int height, void *userdata) {
+    ASSERT_NOT_NULL(location);
+    if (width < 1 || width > 4096 || height < 1 || height > 4096) return NULL;
+    return gstplayer_new(flutterpi, NULL, NULL, location, width, height, userdata);
 }
 
 void gstplayer_destroy(struct gstplayer *player) {
@@ -1775,7 +1629,6 @@ void gstplayer_destroy(struct gstplayer *player) {
     notifier_deinit(&player->error_notifier);
     notifier_deinit(&player->web_event_notifier);
     g_hash_table_unref(player->pending_web_replies);
-    g_async_queue_unref(player->web_tasks);
     g_mutex_clear(&player->web_lock);
     pthread_mutex_destroy(&player->lock);
     if (player->headers != NULL) {
@@ -1787,6 +1640,7 @@ void gstplayer_destroy(struct gstplayer *player) {
     if (player->pipeline_description != NULL) {
         free(player->pipeline_description);
     }
+    free(player->web_location);
     if (player->frame_interface != NULL) {
         frame_interface_unref(player->frame_interface);
     }
@@ -1797,13 +1651,6 @@ void gstplayer_destroy(struct gstplayer *player) {
 
 int64_t gstplayer_get_texture_id(struct gstplayer *player) {
     return player->texture_id;
-}
-
-bool gstplayer_supports_pixel_scroll(struct gstplayer *player) {
-    // FLUTTERPI_WEBVIEW_PIXEL_SCROLL=0 restores 40 px wheel steps for A/B tests.
-    const char *env = getenv("FLUTTERPI_WEBVIEW_PIXEL_SCROLL");
-    if (env != NULL && strcmp(env, "0") == 0) return false;
-    return player->webview_direct != NULL;
 }
 
 int64_t gstplayer_get_platform_view_id(struct gstplayer *player) {
@@ -1930,101 +1777,39 @@ int gstplayer_step_forward(struct gstplayer *player) {
 }
 
 int gstplayer_send_navigation_event(struct gstplayer *player, GstEvent *event) {
-    enum web_pointer_task_kind pointer_kind = kWebPointerTaskNone;
-    struct web_task *task;
-    int ok;
-
     ASSERT_NOT_NULL(player);
     ASSERT_NOT_NULL(event);
-
-    if (player->webview_direct != NULL) {
-        return webview_direct_send_navigation_event(player->webview_direct, event);
-    }
-
-    switch (gst_navigation_event_get_type(event)) {
-        case GST_NAVIGATION_EVENT_MOUSE_MOVE:
-            pointer_kind = kWebPointerTaskMove;
-            if (atomic_exchange(&player->web_move_pending, true)) {
-                gst_event_unref(event);
-                return 0;
-            }
-            break;
-        default: break;
-    }
-
-    task = calloc(1, sizeof(*task));
-    if (task == NULL) {
-        if (pointer_kind == kWebPointerTaskMove) player->web_move_pending = false;
+    if (player->webview_direct == NULL) {
         gst_event_unref(event);
-        return ENOMEM;
+        return EOPNOTSUPP;
     }
-    task->type = kWebTaskNavigation;
-    task->pointer_kind = pointer_kind;
-    task->navigation_event = event;
-    ok = enqueue_web_task(player, task);
-    if (ok != 0 && pointer_kind == kWebPointerTaskMove) {
-        player->web_move_pending = false;
-    }
-    return ok;
+    return webview_direct_send_navigation_event(player->webview_direct, event);
 }
 
 int gstplayer_web_load_url(struct gstplayer *player, const char *url) {
-    struct web_task *task;
     ASSERT_NOT_NULL(player);
     ASSERT_NOT_NULL(url);
-    if (player->webview_direct != NULL) return webview_direct_load_url(player->webview_direct, url);
-
-    task = calloc(1, sizeof(*task));
-    if (task == NULL) return ENOMEM;
-    task->type = kWebTaskLoadUrl;
-    task->string = strdup(url);
-    if (task->string == NULL) {
-        destroy_web_task(task);
-        return ENOMEM;
-    }
-    return enqueue_web_task(player, task);
+    if (player->webview_direct == NULL) return EOPNOTSUPP;
+    return webview_direct_load_url(player->webview_direct, url);
 }
 
 int gstplayer_web_load_bytes(struct gstplayer *player, const uint8_t *data, size_t size) {
-    struct web_task *task;
     ASSERT_NOT_NULL(player);
-    if (player->webview_direct != NULL) return webview_direct_load_bytes(player->webview_direct, data, size);
-
-    task = calloc(1, sizeof(*task));
-    if (task == NULL) return ENOMEM;
-    task->type = kWebTaskLoadBytes;
-    task->bytes = g_bytes_new(data, size);
-    if (task->bytes == NULL) {
-        destroy_web_task(task);
-        return ENOMEM;
-    }
-    return enqueue_web_task(player, task);
-}
-
-bool gstplayer_supports_viewport_resize(struct gstplayer *player) {
-    return player->webview_direct != NULL;
+    if (player->webview_direct == NULL) return EOPNOTSUPP;
+    return webview_direct_load_bytes(player->webview_direct, data, size);
 }
 
 int gstplayer_web_resize(struct gstplayer *player, int width, int height) {
-    if (player->webview_direct == NULL) return ENOTSUP;
+    ASSERT_NOT_NULL(player);
+    if (player->webview_direct == NULL) return EOPNOTSUPP;
     return webview_direct_resize(player->webview_direct, width, height);
 }
 
 int gstplayer_web_run_javascript(struct gstplayer *player, const char *source) {
-    struct web_task *task;
     ASSERT_NOT_NULL(player);
     ASSERT_NOT_NULL(source);
-    if (player->webview_direct != NULL) return webview_direct_run_javascript(player->webview_direct, source);
-
-    task = calloc(1, sizeof(*task));
-    if (task == NULL) return ENOMEM;
-    task->type = kWebTaskRunJavaScript;
-    task->string = strdup(source);
-    if (task->string == NULL) {
-        destroy_web_task(task);
-        return ENOMEM;
-    }
-    return enqueue_web_task(player, task);
+    if (player->webview_direct == NULL) return EOPNOTSUPP;
+    return webview_direct_run_javascript(player->webview_direct, source);
 }
 
 int gstplayer_web_respond_to_handler(

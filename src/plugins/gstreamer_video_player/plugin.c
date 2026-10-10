@@ -1362,15 +1362,11 @@ invalid_headers:
     if (getenv("FLUTTERPI_WEBVIEW_ON_PLANE") != NULL) {
         return platch_respond_success_std(
             responsehandle,
-            &STDMAP4(
+            &STDMAP2(
                 STDSTRING("textureId"),
                 STDINT64(gstplayer_get_texture_id(player)),
                 STDSTRING("platformViewId"),
-                STDINT64(gstplayer_get_platform_view_id(player)),
-                STDSTRING("pixelScroll"),
-                STDBOOL(gstplayer_supports_pixel_scroll(player)),
-                STDSTRING("viewportResize"),
-                STDBOOL(gstplayer_supports_viewport_resize(player))
+                STDINT64(gstplayer_get_platform_view_id(player))
             )
         );
     }
@@ -1388,6 +1384,87 @@ fail_destroy_player:
     gstplayer_destroy(player);
 
 fail_respond_error:
+    return platch_respond_native_error_std(responsehandle, ok);
+}
+
+/// webCreate: [location, width, height] -> {textureId, platformViewId}.
+/// Web views always render on WPEPlatform and present on a DRM plane.
+static int on_web_create_v2(const struct raw_std_value *arg, FlutterPlatformMessageResponseHandle *responsehandle) {
+    const struct raw_std_value *location_value, *width_value, *height_value;
+    struct gstplayer_meta *meta;
+    struct gstplayer *player;
+    char *location;
+    int64_t width, height;
+    int ok;
+
+    ok = ensure_initialized();
+    if (ok != 0) {
+        return respond_init_failed_v2(responsehandle);
+    }
+
+    if (!raw_std_value_is_list(arg) || raw_std_list_get_size(arg) != 3) {
+        return platch_respond_illegal_arg_std(responsehandle, "Expected `arg` to be [location, width, height].");
+    }
+    location_value = raw_std_list_get_first_element(arg);
+    width_value = raw_std_value_after(location_value);
+    height_value = raw_std_value_after(width_value);
+    if (!raw_std_value_is_string(location_value) || !raw_std_value_is_int(width_value) || !raw_std_value_is_int(height_value)) {
+        return platch_respond_illegal_arg_std(responsehandle, "Expected [String, int, int].");
+    }
+    width = raw_std_value_as_int(width_value);
+    height = raw_std_value_as_int(height_value);
+    if (width < 1 || width > 4096 || height < 1 || height > 4096) {
+        return platch_respond_illegal_arg_std(responsehandle, "Web view dimensions must be 1..4096.");
+    }
+
+    location = raw_std_string_dup(location_value);
+    if (location == NULL) {
+        return platch_respond_native_error_std(responsehandle, ENOMEM);
+    }
+    player = gstplayer_new_web(flutterpi, location, (int) width, (int) height, NULL);
+    free(location);
+    if (player == NULL) {
+        LOG_ERROR("Couldn't create the WPE web view.\n");
+        return platch_respond_native_error_std(responsehandle, EIO);
+    }
+
+    meta = create_meta(gstplayer_get_texture_id(player), player);
+    if (meta == NULL) {
+        ok = ENOMEM;
+        goto fail_destroy_player;
+    }
+    gstplayer_set_userdata_locked(player, meta);
+    add_player(meta);
+
+    ok = plugin_registry_set_receiver(meta->event_channel_name, kStandardMethodCall, on_receive_evch);
+    if (ok != 0) {
+        goto fail_remove_player;
+    }
+
+    ok = gstplayer_initialize(player);
+    if (ok != 0) {
+        goto fail_remove_receiver;
+    }
+
+    return platch_respond_success_std(
+        responsehandle,
+        &STDMAP2(
+            STDSTRING("textureId"),
+            STDINT64(gstplayer_get_texture_id(player)),
+            STDSTRING("platformViewId"),
+            STDINT64(gstplayer_get_platform_view_id(player))
+        )
+    );
+
+fail_remove_receiver:
+    plugin_registry_remove_receiver(meta->event_channel_name);
+
+fail_remove_player:
+    remove_player(meta);
+    destroy_meta(meta);
+
+fail_destroy_player:
+    gstplayer_destroy(player);
     return platch_respond_native_error_std(responsehandle, ok);
 }
 
@@ -1691,18 +1768,6 @@ static int on_web_pointer_event_v2(const struct raw_std_value *arg, FlutterPlatf
     ok = gstplayer_send_navigation_event(player, event);
     if (ok != 0) return platch_respond_native_error_std(responsehandle, ok);
 
-    // wpevideosrc only dispatches accumulated touch points to WPE WebKit when
-    // it receives a touch-frame navigation event, so send one after every
-    // touch event. WebKit's TouchGestureController then performs tap/pan
-    // disambiguation and converts drags into pixel-accurate smooth axis
-    // events, which is what makes touch scrolling track the finger.
-    if (raw_std_string_equals(type, "touchDown") || raw_std_string_equals(type, "touchMove") ||
-        raw_std_string_equals(type, "touchUp")) {
-        event = gst_navigation_event_new_touch_frame(modifiers);
-        ok = gstplayer_send_navigation_event(player, event);
-        if (ok != 0) return platch_respond_native_error_std(responsehandle, ok);
-    }
-
     return platch_respond_success_std(responsehandle, &STDNULL);
 }
 
@@ -1910,6 +1975,8 @@ static int on_receive_method_channel_v2(char *channel, struct platch_obj *object
         return on_initialize_v2(arg, responsehandle);
     } else if (raw_std_string_equals(method, "create")) {
         return on_create_v2(arg, responsehandle);
+    } else if (raw_std_string_equals(method, "webCreate")) {
+        return on_web_create_v2(arg, responsehandle);
     } else if (raw_std_string_equals(method, "dispose")) {
         return on_dispose_v2(arg, responsehandle);
     } else if (raw_std_string_equals(method, "setLooping")) {
