@@ -600,6 +600,7 @@ static struct {
     GThread *thread;
     WPEDisplay *display;
     WebKitWebContext *web_context;
+    WebKitNetworkSession *network_session;
 } shared;
 
 static void *run_webkit_thread(void *userdata) {
@@ -622,10 +623,21 @@ static void *run_webkit_thread(void *userdata) {
     shared.display = display;
     shared.web_context = display != NULL ? WEBKIT_WEB_CONTEXT(g_object_new(WEBKIT_TYPE_WEB_CONTEXT, NULL)) : NULL;
     if (shared.web_context != NULL) {
-        // No web process cache or back/forward page cache: a closed webview's
-        // web process exits instead of idling at ~100 MB for reuse. Costs a
-        // slower reopen and slower Back navigation.
+        // Same persistent directories/settings as WebKit's default session,
+        // but owned here, for the lifetime of the WebKit thread. The default
+        // session has a C++ static destructor: exit() on the platform thread
+        // would finalize it on the wrong thread (and abort in WebKit).
+        shared.network_session = webkit_network_session_new(NULL, NULL);
+        // The cache model is process-global. WebKit 2.54 sets the process-cache
+        // capacity when constructing a context, but changing the cache model
+        // afterwards only updates the page/resource caches. Set the model on
+        // this temporary context, then create the actual context with it in
+        // effect. Use public APIs rather than terminating shared web processes.
         webkit_web_context_set_cache_model(shared.web_context, WEBKIT_CACHE_MODEL_DOCUMENT_VIEWER);
+        g_object_unref(shared.web_context);
+        shared.web_context = webkit_web_context_new();
+        // Workers can still legitimately retain processes after their last
+        // view closes. DocumentViewer is not a worker-termination policy.
     }
     shared.ready = true;
     g_cond_broadcast(&shared.cond);
@@ -716,7 +728,16 @@ static gboolean create_on_thread(void *userdata) {
     WebKitWebView *web_view;
     WPEView *wpe_view;
 
-    web_view = WEBKIT_WEB_VIEW(g_object_new(WEBKIT_TYPE_WEB_VIEW, "web-context", shared.web_context, "display", shared.display, NULL));
+    web_view = WEBKIT_WEB_VIEW(g_object_new(
+        WEBKIT_TYPE_WEB_VIEW,
+        "web-context",
+        shared.web_context,
+        "network-session",
+        shared.network_session,
+        "display",
+        shared.display,
+        NULL
+    ));
     wpe_view = webkit_web_view_get_wpe_view(web_view);
     if (wpe_view == NULL || !G_TYPE_CHECK_INSTANCE_TYPE(wpe_view, flutterpi_wpe_view_get_type())) {
         LOG_ERROR("webview direct: WebKit did not create its view on the flutter-pi display.\n");
