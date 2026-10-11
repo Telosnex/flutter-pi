@@ -84,11 +84,18 @@ void frame_scheduler_on_present_failed(struct frame_scheduler *scheduler);
 
 /**
  * @brief Calls @p cb once, at the next page flip (after any queued frame has
- * been committed), or when a commit fails. Any thread.
+ * been committed), when a commit fails, or during scheduler destruction. Any thread.
  *
  * @returns false if too many listeners are waiting; @p cb is then not called.
  */
 bool frame_scheduler_on_next_scanout(struct frame_scheduler *scheduler, void_callback_t cb, void *userdata);
+
+/**
+ * Remove a listener identified by its unique (cb, userdata) pair. Any thread.
+ * True: removed, cb will not run; caller may release its callback reference.
+ * False: already dispatched (possibly still running); cb owns that reference.
+ */
+bool frame_scheduler_cancel_scanout_listener(struct frame_scheduler *scheduler, void_callback_t cb, void *userdata);
 
 /**
  * @brief Called when flutter calls the embedder supplied vsync_callback.

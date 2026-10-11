@@ -210,6 +210,38 @@ void test_spurious_scanout_is_ignored() {
     frame_scheduler_unref(s);
 }
 
+static void count_scanout(void *userdata) {
+    (*(int *) userdata)++;
+}
+
+void test_cancel_and_shutdown_release_listeners_once(void) {
+    struct frame_scheduler *s = make_scheduler();
+    int cancelled = 0, remaining = 0;
+    TEST_ASSERT_TRUE(frame_scheduler_on_next_scanout(s, count_scanout, &cancelled));
+    TEST_ASSERT_TRUE(frame_scheduler_on_next_scanout(s, count_scanout, &remaining));
+    TEST_ASSERT_TRUE(frame_scheduler_cancel_scanout_listener(s, count_scanout, &cancelled));
+    TEST_ASSERT_FALSE(frame_scheduler_cancel_scanout_listener(s, count_scanout, &cancelled));
+    frame_scheduler_unref(s);
+    TEST_ASSERT_EQUAL_INT(0, cancelled);
+    TEST_ASSERT_EQUAL_INT(1, remaining);
+}
+
+void test_listener_capacity_is_recovered_by_cancellation(void) {
+    struct frame_scheduler *s = make_scheduler();
+    int counts[FRAME_SCHEDULER_MAX_SCANOUT_LISTENERS + 1] = { 0 };
+    for (int i = 0; i < FRAME_SCHEDULER_MAX_SCANOUT_LISTENERS; i++)
+        TEST_ASSERT_TRUE(frame_scheduler_on_next_scanout(s, count_scanout, &counts[i]));
+    TEST_ASSERT_FALSE(frame_scheduler_on_next_scanout(s, count_scanout, &counts[FRAME_SCHEDULER_MAX_SCANOUT_LISTENERS]));
+    TEST_ASSERT_TRUE(frame_scheduler_cancel_scanout_listener(s, count_scanout, &counts[0]));
+    TEST_ASSERT_TRUE(frame_scheduler_on_next_scanout(s, count_scanout, &counts[FRAME_SCHEDULER_MAX_SCANOUT_LISTENERS]));
+    frame_scheduler_on_scanout(s, false, 0);
+    TEST_ASSERT_FALSE(frame_scheduler_cancel_scanout_listener(s, count_scanout, &counts[1]));
+    frame_scheduler_unref(s);
+    TEST_ASSERT_EQUAL_INT(0, counts[0]);
+    for (int i = 1; i <= FRAME_SCHEDULER_MAX_SCANOUT_LISTENERS; i++)
+        TEST_ASSERT_EQUAL_INT(1, counts[i]);
+}
+
 int main() {
     UNITY_BEGIN();
     RUN_TEST(test_present_when_idle_presents_immediately);
@@ -220,5 +252,7 @@ int main() {
     RUN_TEST(test_vsync_reply_does_not_wait_behind_queued_frame);
     RUN_TEST(test_present_failure_resets_pipeline);
     RUN_TEST(test_spurious_scanout_is_ignored);
+    RUN_TEST(test_cancel_and_shutdown_release_listeners_once);
+    RUN_TEST(test_listener_capacity_is_recovered_by_cancellation);
     return UNITY_END();
 }

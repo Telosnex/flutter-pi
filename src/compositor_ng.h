@@ -173,6 +173,9 @@ int compositor_set_platform_view(struct compositor *compositor, int64_t id, stru
 /// See window_request_repaint.
 int compositor_request_repaint(struct compositor *compositor, void_callback_t on_scanout, void *userdata);
 
+/// See window_cancel_repaint.
+bool compositor_cancel_repaint(struct compositor *compositor, void_callback_t on_scanout, void *userdata);
+
 struct surface *compositor_get_view_by_id_locked(struct compositor *compositor, int64_t view_id);
 
 const FlutterCompositor *compositor_get_flutter_compositor(struct compositor *compositor);

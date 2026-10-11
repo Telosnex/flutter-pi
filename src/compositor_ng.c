@@ -433,6 +433,10 @@ int compositor_request_repaint(struct compositor *compositor, void_callback_t on
     return window_request_repaint(compositor->main_window, on_scanout, userdata);
 }
 
+bool compositor_cancel_repaint(struct compositor *compositor, void_callback_t on_scanout, void *userdata) {
+    return window_cancel_repaint(compositor->main_window, on_scanout, userdata);
+}
+
 int compositor_set_platform_view(struct compositor *compositor, int64_t id, struct surface *surface) {
     struct platform_view_with_id *view;
     struct surface *previous = NULL;

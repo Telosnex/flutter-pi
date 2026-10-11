@@ -75,6 +75,12 @@ endforeach()
 set_property(TARGET surface_lifecycle_test PROPERTY INTERPROCEDURAL_OPTIMIZATION FALSE)
 add_test(NAME surface_lifecycle_test COMMAND surface_lifecycle_test)
 
+add_executable(window_repaint_test window_repaint_test.c)
+target_link_libraries(window_repaint_test lifecycle_test_support Unity)
+target_link_options(window_repaint_test PRIVATE "LINKER:--wrap=drmdev_create_request_builder")
+set_property(TARGET window_repaint_test PROPERTY INTERPROCEDURAL_OPTIMIZATION FALSE)
+add_test(NAME window_repaint_test COMMAND window_repaint_test)
+
 # Compile the wrapped call sites without LTO: cross-module inlining bypasses
 # --wrap and would call real DRM functions with the test's fake device.
 target_sources(surface_lifecycle_test PRIVATE
