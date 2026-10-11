@@ -1,0 +1,79 @@
+# Builds the Telosnex runner for the Raspberry Pi 5 (Debian 13 arm64) against
+# the pinned WPE WebKit SDK (telosnex/wpe-sdk.env), and runs the tests.
+# A telosnex/* tag publishes the binary as an immutable GitHub release:
+#   git tag telosnex/<yyyy-mm-dd>-<short sha> && git push origin <tag>
+# Telosnex's toolchain lock records the tag and the binary's SHA-256.
+name: Telosnex runner
+
+on:
+  push:
+    branches: [telosnex_main]
+    tags: ['telosnex/*']
+  pull_request:
+    branches: [telosnex_main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: debian-13-arm64
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    container:
+      image: debian@sha256:913f6706df59a68922d1dd08f78c2476560a8d367897200a6005b00e5f67c2d5
+    steps:
+      - name: Install git
+        run: |
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends ca-certificates git > /dev/null
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          submodules: true
+      - name: Install build dependencies
+        run: telosnex/install_build_deps.sh
+      - name: Build and test
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          telosnex/build.sh "$RUNNER_TEMP/out"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: flutter-pi-debian-13-arm64
+          path: ${{ runner.temp }}/out/
+          if-no-files-found: error
+
+  publish:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/telosnex/')
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: flutter-pi-debian-13-arm64
+          path: ${{ runner.temp }}/out
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          cd "$RUNNER_TEMP/out"
+          test "$(jq -r .revision flutter-pi.json)" = "$GITHUB_SHA"
+          echo "$(jq -r .sha256 flutter-pi.json)  flutter-pi" | sha256sum -c -
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "::error::Release $TAG exists. Releases are immutable."
+            exit 1
+          fi
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft \
+            --title "Telosnex runner $TAG" \
+            --notes "Built from $GITHUB_SHA against $(jq -r .wpeSdkTag flutter-pi.json). SHA-256 $(jq -r .sha256 flutter-pi.json)." \
+            flutter-pi flutter-pi.json
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false
+          echo "Release: https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG" >> "$GITHUB_STEP_SUMMARY"

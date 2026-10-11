@@ -101,3 +101,5 @@ Temporary Items
 .apdisk
 
 .cache
+.wpe-sdk/
+build-telosnex/
