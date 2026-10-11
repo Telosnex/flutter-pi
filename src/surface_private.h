@@ -31,6 +31,7 @@ struct surface {
     pthread_mutex_t lock;
     struct tracer *tracer;
     int64_t revision;
+    int64_t id; // Process-unique: never derived from a reusable allocation address.
 
     int (*present_kms)(struct surface *s, const struct fl_layer_props *props, struct kms_req_builder *builder);
     int (*present_fbdev)(struct surface *s, const struct fl_layer_props *props, struct fbdev_commit_builder *builder);

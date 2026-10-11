@@ -48,6 +48,10 @@ unsigned dmabuf_surface_take_unshown_count(void);
 /// buffer since the last call. Such buffers are skipped, not shown.
 bool dmabuf_surface_take_import_failed(struct dmabuf_surface *s);
 
+/// Drop the queued buffer after stopping the producer. In-flight scanout
+/// references remain valid until KMS retires them. Safe to call more than once.
+void dmabuf_surface_clear(struct dmabuf_surface *s);
+
 int dmabuf_surface_push_dmabuf(struct dmabuf_surface *s, const struct dmabuf *buf, dmabuf_release_cb_t release_cb);
 
 /// True once the compositor has actually pushed this surface as a KMS layer.

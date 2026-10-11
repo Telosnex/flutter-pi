@@ -74,7 +74,7 @@ struct fl_layer_composition *fl_layer_composition_new(size_t n_layers) {
     struct fl_layer_composition *composition;
     struct fl_layer *layers;
 
-    composition = malloc((sizeof *composition) + (n_layers * sizeof *layers));
+    composition = calloc(1, (sizeof *composition) + (n_layers * sizeof *layers));
     if (composition == NULL) {
         return NULL;
     }
@@ -100,7 +100,8 @@ void fl_layer_composition_destroy(struct fl_layer_composition *composition) {
     ASSERT_NOT_NULL(composition);
 
     for (int i = 0; i < composition->n_layers; i++) {
-        surface_unref(composition->layers[i].surface);
+        if (composition->layers[i].surface != NULL)
+            surface_unref(composition->layers[i].surface);
         if (composition->layers[i].props.clip_rects != NULL) {
             free(composition->layers[i].props.clip_rects);
         }
@@ -359,23 +360,21 @@ static int compositor_push_fl_layers(struct compositor *compositor, size_t n_fl_
         } else {
             ASSERT_EQUALS(fl_layer->type, kFlutterLayerContentTypePlatformView);
 
-            /// TODO: Maybe always check if the ID is valid?
-#if DEBUG
-            // if we're in debug mode, we actually check if the ID is a valid,
-            // registered ID.
-            /// TODO: Implement
+            // Resolve even in release builds: Flutter may send a final frame
+            // for a platform view after its player has been disposed.
             layer->surface = compositor_get_view_by_id_locked(compositor, fl_layer->platform_view->identifier);
-            if (layer->surface == NULL) {
-                layer->surface =
-                    CAST_SURFACE(dummy_render_surface_new(compositor->tracer, VEC2I(fl_layer->size.width, fl_layer->size.height)));
+            if (layer->surface != NULL) {
+                layer->surface = surface_ref(layer->surface);
+            } else {
+                layer->surface = CAST_SURFACE_UNCHECKED(
+                    dummy_render_surface_new(compositor->tracer, VEC2I(fl_layer->size.width, fl_layer->size.height))
+                );
+                if (layer->surface == NULL) {
+                    compositor_unlock(compositor);
+                    fl_layer_composition_unref(composition);
+                    return ENOMEM;
+                }
             }
-#else
-            // in release mode, we just assume the id is valid.
-            // Since the surface constructs the ID by just casting the surface pointer to an int64_t,
-            // we can easily cast it back without too much trouble.
-            // Only problem is if the id is garbage, we won't notice and the returned surface is garbage too.
-            layer->surface = surface_ref(surface_from_id(fl_layer->platform_view->identifier));
-#endif
 
             struct view_geometry geometry = window_get_view_geometry(compositor->main_window);
 
@@ -402,10 +401,6 @@ static int compositor_push_fl_layers(struct compositor *compositor, size_t n_fl_
 
     fl_layer_composition_unref(composition);
 
-    return 0;
-
-    //fail_free_composition:
-    //fl_layer_composition_unref(composition);
     return ok;
 }
 
@@ -440,10 +435,10 @@ int compositor_request_repaint(struct compositor *compositor, void_callback_t on
 
 int compositor_set_platform_view(struct compositor *compositor, int64_t id, struct surface *surface) {
     struct platform_view_with_id *view;
+    struct surface *previous = NULL;
 
     ASSERT_NOT_NULL(compositor);
     assert(id != 0);
-    ASSERT_NOT_NULL(surface);
 
     compositor_lock(compositor);
 
@@ -467,15 +462,20 @@ int compositor_set_platform_view(struct compositor *compositor, int64_t id, stru
     } else {
         ASSERT_NOT_NULL(view->surface);
         if (surface == NULL) {
+            // Deletion moves the last element over this inline entry. Save
+            // its owned reference first; the entry is not a heap allocation.
+            previous = view->surface;
             util_dynarray_delete_unordered_ext(&compositor->views, struct platform_view_with_id, *view, platform_view_with_id_equal);
-            surface_unref(view->surface);
-            free(view);
         } else {
-            surface_swap_ptrs(&view->surface, surface);
+            previous = view->surface;
+            view->surface = surface_ref(surface);
         }
     }
 
     compositor_unlock(compositor);
+    // Destruction can call into texture/engine code; do not hold our lock.
+    if (previous != NULL)
+        surface_unref(previous);
     return 0;
 }
 

@@ -1671,9 +1671,7 @@ static struct gstplayer *gstplayer_new(struct flutterpi *flutterpi, const char *
             flutterpi_get_texture_registry(player->flutterpi)
         );
         if (player->dmabuf_surface != NULL) {
-            // The compositor casts this id straight back to a surface pointer in
-        // release builds (compositor_ng.c), so it MUST be the surface pointer.
-        player->platform_view_id = (int64_t) (intptr_t) CAST_SURFACE_UNCHECKED(player->dmabuf_surface);
+            player->platform_view_id = surface_get_id(CAST_SURFACE_UNCHECKED(player->dmabuf_surface));
             compositor_set_platform_view(
                 flutterpi_get_compositor(player->flutterpi),
                 player->platform_view_id,
@@ -1763,6 +1761,15 @@ struct gstplayer *gstplayer_new_from_pipeline(struct flutterpi *flutterpi, const
 void gstplayer_destroy(struct gstplayer *player) {
     LOG_DEBUG("gstplayer_destroy(%p)\n", player);
     maybe_deinit(player);
+    // The producer is stopped. Late Flutter frames must resolve the old ID
+    // to an empty layer, not a freed/reused surface address. Existing KMS
+    // requests still own their buffers until the display retires them.
+    if (player->dmabuf_surface != NULL) {
+        compositor_set_platform_view(flutterpi_get_compositor(player->flutterpi), player->platform_view_id, NULL);
+        dmabuf_surface_clear(player->dmabuf_surface);
+        surface_unref(CAST_SURFACE_UNCHECKED(player->dmabuf_surface));
+        player->dmabuf_surface = NULL;
+    }
     notifier_deinit(&player->video_info_notifier);
     notifier_deinit(&player->buffering_state_notifier);
     notifier_deinit(&player->error_notifier);

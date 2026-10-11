@@ -43,6 +43,8 @@ int surface_init(struct surface *s, struct tracer *tracer) {
     pthread_mutex_init(&s->lock, NULL);
     s->tracer = tracer_ref(tracer);
     s->revision = 1;
+    static atomic_int_fast64_t next_id = 1;
+    s->id = atomic_fetch_add_explicit(&next_id, 1, memory_order_relaxed);
     s->present_kms = NULL;
     s->present_fbdev = NULL;
     s->deinit = surface_deinit;
@@ -81,6 +83,10 @@ void surface_destroy(struct surface *s) {
 DEFINE_LOCK_OPS(surface, lock)
 
 DEFINE_REF_OPS(surface, n_refs)
+
+int64_t surface_get_id(struct surface *s) {
+    return s->id;
+}
 
 int64_t surface_get_revision(struct surface *s) {
     ASSERT_NOT_NULL(s);

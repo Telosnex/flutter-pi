@@ -34,9 +34,8 @@ DECLARE_LOCK_OPS(surface)
 
 DECLARE_REF_OPS(surface)
 
-ATTR_PURE static inline struct surface *surface_from_id(int64_t id) {
-    return CAST_SURFACE(int64_to_ptr(id));
-}
+/// Stable process-unique platform view ID. Resolve through the compositor registry.
+ATTR_PURE int64_t surface_get_id(struct surface *s);
 
 ATTR_PURE int64_t surface_get_revision(struct surface *s);
 

@@ -166,6 +166,8 @@ ATTR_PURE double compositor_get_refresh_rate(struct compositor *compositor);
 
 int compositor_get_next_vblank(struct compositor *compositor, uint64_t *next_vblank_ns_out);
 
+/// The registry takes a reference. Passing NULL removes it (idempotently).
+/// IDs must not be reused; surface_get_id supplies process-unique IDs.
 int compositor_set_platform_view(struct compositor *compositor, int64_t id, struct surface *surface);
 
 /// See window_request_repaint.
