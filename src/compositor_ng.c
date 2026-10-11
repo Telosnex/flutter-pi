@@ -343,15 +343,22 @@ static int compositor_push_fl_layers(struct compositor *compositor, size_t n_fl_
 
 
         if (fl_layer->type == kFlutterLayerContentTypeBackingStore) {
-            /// TODO: Implement
-            layer->surface = surface_ref(CAST_SURFACE(fl_layer->backing_store->user_data));
-
-            // Tell the surface that flutter has rendered into this framebuffer / texture / image.
-            // It'll also read the did_update field and not update the surface revision in that case.
-            render_surface_queue_present(CAST_RENDER_SURFACE(layer->surface), fl_layer->backing_store);
+            struct render_surface *render_surface = CAST_RENDER_SURFACE(fl_layer->backing_store->user_data);
+            ok = render_surface_queue_present(render_surface, fl_layer->backing_store);
+            if (ok != 0) {
+                compositor_unlock(compositor);
+                fl_layer_composition_unref(composition);
+                return ok;
+            }
+            layer->surface = render_surface_get_present_surface(render_surface, fl_layer->backing_store);
+            if (layer->surface == NULL) {
+                compositor_unlock(compositor);
+                fl_layer_composition_unref(composition);
+                return ENOMEM;
+            }
 
             layer->props.is_aa_rect = true;
-            layer->props.aa_rect = AA_RECT_FROM_COORDS(fl_layer->offset.y, fl_layer->offset.y, fl_layer->size.width, fl_layer->size.height);
+            layer->props.aa_rect = AA_RECT_FROM_COORDS(fl_layer->offset.x, fl_layer->offset.y, fl_layer->size.width, fl_layer->size.height);
             layer->props.quad = get_quad(layer->props.aa_rect);
             layer->props.opacity = 1.0;
             layer->props.rotation = 0.0;
@@ -533,7 +540,7 @@ on_flutter_create_backing_store(const FlutterBackingStoreConfig *config, Flutter
     // so we set the user_data after the fill
     ok = render_surface_fill(s, backing_store_out);
     if (ok != 0) {
-        LOG_ERROR("Couldn't fill flutter backing store with concrete OpenGL framebuffer/texture or Vulkan image.\n");
+        LOG_ERROR("Couldn't fill Flutter backing store (%.0fx%.0f): %s (%d).\n", config->size.width, config->size.height, strerror(ok), ok);
         return false;
     }
 

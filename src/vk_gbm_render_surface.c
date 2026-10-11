@@ -14,6 +14,8 @@
 #include <stdatomic.h>
 #include <stdlib.h>
 
+#include <fcntl.h>
+#include <poll.h>
 #include <unistd.h>
 
 #include <vulkan.h>
@@ -27,6 +29,7 @@
 #include "util/logging.h"
 #include "util/refcounting.h"
 #include "vk_renderer.h"
+#include "vk_queue_sync.h"
 
 struct vk_gbm_render_surface;
 struct vk_renderer;
@@ -38,11 +41,21 @@ struct fb {
     FlutterVulkanImage fl_image;
 };
 
+// Two Flutter layers across current, pending and rendering frames. This is a
+// bounded pool, not a guarantee for arbitrary layer counts; exhaustion remains
+// a recoverable EAGAIN instead of reusing a live image.
+enum { VK_GBM_BUFFER_COUNT = 6 };
+
 struct locked_fb {
     struct vk_gbm_render_surface *surface;
     atomic_flag is_locked;
+    atomic_bool flutter_owned;
     refcount_t n_refs;
     struct fb *fb;
+    // One completion payload per acquired backing-store generation. Retain
+    // the original fd and duplicate it for each KMS request, including repaints.
+    bool completion_captured;
+    int completion_fd;  // -1 with completion_captured means already complete
 };
 
 struct vk_gbm_render_surface {
@@ -64,9 +77,9 @@ struct vk_gbm_render_surface {
     /**
      * @brief Just some vulkan images that are compatible with GBM/DRM/KMS.
      *
-     * 4 framebuffers is good enough for most use-cases.
+     * Space for two layers in each of three overlapping frames.
      */
-    struct fb fbs[4];
+    struct fb fbs[VK_GBM_BUFFER_COUNT];
 
     /**
      * @brief This is just some locking wrapper around the simple fbs above.
@@ -76,7 +89,7 @@ struct vk_gbm_render_surface {
      * Once the reference count drops to zero, is_locked will be set to false and the fb is ready to be reused again.
      *
      */
-    struct locked_fb locked_fbs[4];
+    struct locked_fb locked_fbs[VK_GBM_BUFFER_COUNT];
 
     /**
      * @brief The framebuffer that was last queued to be presented using @ref vk_gbm_render_surface_queue_present_vulkan.
@@ -110,6 +123,7 @@ struct vk_gbm_render_surface {
     VkSemaphore render_finished_semaphore;
     PFN_vkGetSemaphoreFdKHR get_semaphore_fd;
     bool logged_explicit_sync_fallback;
+    bool semaphore_failed;
 
 #ifdef DEBUG
     /**
@@ -120,20 +134,50 @@ struct vk_gbm_render_surface {
 #endif
 };
 
+static void reset_completion(struct locked_fb *fb) {
+    if (fb->completion_captured && fb->completion_fd >= 0)
+        close(fb->completion_fd);
+    fb->completion_fd = -1;
+    fb->completion_captured = false;
+}
+
 static void locked_fb_destroy(struct locked_fb *fb) {
     struct vk_gbm_render_surface *surface;
 
     surface = fb->surface;
+    reset_completion(fb);
     fb->surface = NULL;
 
 #ifdef DEBUG
     atomic_fetch_sub(&surface->n_locked_fbs, 1);
 #endif
     atomic_flag_clear(&fb->is_locked);
-    surface_unref(CAST_SURFACE(surface));
+    (void) surface;
 }
 
-DEFINE_STATIC_REF_OPS(locked_fb, n_refs)
+// External owners (Flutter, immutable layer snapshots, KMS) each retain the
+// containing surface. The surface's own front-buffer pin must NOT retain it.
+static struct locked_fb *locked_fb_ref(struct locked_fb *fb) {
+    surface_ref(CAST_SURFACE(fb->surface));
+    refcount_inc(&fb->n_refs);
+    return fb;
+}
+static void locked_fb_unref(struct locked_fb *fb) {
+    struct surface *owner = CAST_SURFACE(fb->surface);
+    if (!refcount_dec(&fb->n_refs))
+        locked_fb_destroy(fb);
+    surface_unref(owner);
+}
+static void set_front_fb(struct vk_gbm_render_surface *s, struct locked_fb *fb) {
+    struct locked_fb *old = s->front_fb;
+    if (old == fb)
+        return;
+    if (fb)
+        refcount_inc(&fb->n_refs);  // internal pin, no surface ref
+    s->front_fb = fb;
+    if (old && !refcount_dec(&old->n_refs))
+        locked_fb_destroy(old);
+}
 
 UNUSED static bool atomic_flag_test(atomic_flag *flag) {
     bool before = atomic_flag_test_and_set(flag);
@@ -145,19 +189,11 @@ UNUSED static bool atomic_flag_test(atomic_flag *flag) {
 
 static void log_locked_fbs(struct vk_gbm_render_surface *surface, const char *note) {
 #ifdef VK_LOG_LOCKED_FBS
-    LOG_DEBUG(
-        "locked: %c, %c, %c, %c",
-        atomic_flag_test(&surface->locked_fbs[0].is_locked) ? 'y' : 'n',
-        atomic_flag_test(&surface->locked_fbs[1].is_locked) ? 'y' : 'n',
-        atomic_flag_test(&surface->locked_fbs[2].is_locked) ? 'y' : 'n',
-        atomic_flag_test(&surface->locked_fbs[3].is_locked) ? 'y' : 'n'
-    );
-
-    if (note != NULL) {
-        LOG_DEBUG_UNPREFIXED(" (%s)\n", note);
-    } else {
-        LOG_DEBUG_UNPREFIXED("\n");
+    LOG_DEBUG("locked buffers (%s):", note ? note : "");
+    for (size_t i = 0; i < ARRAY_SIZE(surface->locked_fbs); i++) {
+        LOG_DEBUG_UNPREFIXED(" %zu:%c", i, atomic_flag_test(&surface->locked_fbs[i].is_locked) ? 'y' : 'n');
     }
+    LOG_DEBUG_UNPREFIXED("\n");
 #else
     (void) surface;
     (void) note;
@@ -188,6 +224,7 @@ void vk_gbm_render_surface_deinit(struct surface *s);
 static int vk_gbm_render_surface_present_kms(struct surface *s, const struct fl_layer_props *props, struct kms_req_builder *builder);
 static int vk_gbm_render_surface_present_fbdev(struct surface *s, const struct fl_layer_props *props, struct fbdev_commit_builder *builder);
 static int vk_gbm_render_surface_fill(struct render_surface *surface, FlutterBackingStore *fl_store);
+static struct surface *vk_gbm_render_surface_get_present_surface(struct render_surface *s, const FlutterBackingStore *store);
 static int vk_gbm_render_surface_queue_present(struct render_surface *surface, const FlutterBackingStore *fl_store);
 
 static bool is_srgb_format(VkFormat vk_format) {
@@ -205,6 +242,77 @@ static VkFormat srgb_to_unorm_format(VkFormat vk_format) {
     }
 }
 
+static const VkImageUsageFlags fb_image_usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                                                VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+
+static int check_import_support(struct vk_renderer *renderer, VkFormat format, uint64_t modifier, int width, int height) {
+    if (modifier == DRM_FORMAT_MOD_INVALID || width <= 0 || height <= 0)
+        return ENOTSUP;
+
+    VkPhysicalDevice physical = vk_renderer_get_physical_device(renderer);
+    VkDrmFormatModifierPropertiesListEXT modifiers = {
+        .sType = VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT,
+    };
+    VkFormatProperties2 formats = { .sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2, .pNext = &modifiers };
+    vkGetPhysicalDeviceFormatProperties2(physical, format, &formats);
+    if (modifiers.drmFormatModifierCount == 0)
+        return ENOTSUP;
+    modifiers.pDrmFormatModifierProperties = calloc(modifiers.drmFormatModifierCount, sizeof(*modifiers.pDrmFormatModifierProperties));
+    if (!modifiers.pDrmFormatModifierProperties)
+        return ENOMEM;
+    vkGetPhysicalDeviceFormatProperties2(physical, format, &formats);
+    bool supported = false;
+    const VkFormatFeatureFlags required = VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_TRANSFER_SRC_BIT |
+                                          VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+    for (uint32_t i = 0; i < modifiers.drmFormatModifierCount; i++) {
+        const VkDrmFormatModifierPropertiesEXT *p = &modifiers.pDrmFormatModifierProperties[i];
+        if (p->drmFormatModifier == modifier && p->drmFormatModifierPlaneCount == 1 &&
+            (p->drmFormatModifierTilingFeatures & required) == required) {
+            supported = true;
+            break;
+        }
+    }
+    free(modifiers.pDrmFormatModifierProperties);
+    if (!supported)
+        return ENOTSUP;
+
+    VkPhysicalDeviceImageDrmFormatModifierInfoEXT modifier_info = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT,
+        .drmFormatModifier = modifier,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+    };
+    VkPhysicalDeviceExternalImageFormatInfo external_info = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO,
+        .pNext = &modifier_info,
+        .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+    };
+    VkPhysicalDeviceImageFormatInfo2 info = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2,
+        .pNext = &external_info,
+        .format = format,
+        .type = VK_IMAGE_TYPE_2D,
+        .tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
+        .usage = fb_image_usage,
+    };
+    VkExternalImageFormatProperties external_props = { .sType = VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES };
+    VkImageFormatProperties2 props = { .sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2, .pNext = &external_props };
+    VkResult result = vkGetPhysicalDeviceImageFormatProperties2(physical, &info, &props);
+    if (result == VK_ERROR_FORMAT_NOT_SUPPORTED)
+        return ENOTSUP;
+    if (result != VK_SUCCESS) {
+        LOG_VK_ERROR(result, "Couldn't query Vulkan dma-buf import support");
+        return EIO;
+    }
+    if (!(external_props.externalMemoryProperties.externalMemoryFeatures & VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT) ||
+        !(external_props.externalMemoryProperties.compatibleHandleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT) ||
+        props.imageFormatProperties.maxExtent.width < (uint32_t) width ||
+        props.imageFormatProperties.maxExtent.height < (uint32_t) height || props.imageFormatProperties.maxExtent.depth < 1 ||
+        props.imageFormatProperties.maxMipLevels < 1 || props.imageFormatProperties.maxArrayLayers < 1 ||
+        !(props.imageFormatProperties.sampleCounts & VK_SAMPLE_COUNT_1_BIT))
+        return ENOTSUP;
+    return 0;
+}
+
 static int
 fb_init(struct fb *fb, struct gbm_device *gbm_device, struct vk_renderer *renderer, int width, int height, enum pixfmt pixel_format) {
     PFN_vkGetMemoryFdPropertiesKHR get_memory_fd_props;
@@ -217,10 +325,11 @@ fb_init(struct fb *fb, struct gbm_device *gbm_device, struct vk_renderer *render
     VkImage vkimg;
     int fd;
 
-    ASSERT_MSG(
-        get_pixfmt_info(pixel_format)->vk_format != VK_FORMAT_UNDEFINED,
-        "Given pixel format is not compatible with any vulkan sRGB format."
-    );
+    vk_format = get_pixfmt_info(pixel_format)->vk_format;
+    if (vk_format == VK_FORMAT_UNDEFINED) {
+        LOG_ERROR("Pixel format is not supported by the Vulkan renderer.\n");
+        return ENOTSUP;
+    }
 
     device = vk_renderer_get_device(renderer);
 
@@ -230,7 +339,6 @@ fb_init(struct fb *fb, struct gbm_device *gbm_device, struct vk_renderer *render
     /// We're just converting the _SRGB to a _UNORM here, but I'm not really sure that's guaranteed to work.
     /// (_UNORM can mean anything basically)
 
-    vk_format = get_pixfmt_info(pixel_format)->vk_format;
     if (is_srgb_format(vk_format)) {
         vk_format = srgb_to_unorm_format(vk_format);
     }
@@ -241,9 +349,26 @@ fb_init(struct fb *fb, struct gbm_device *gbm_device, struct vk_renderer *render
         return EIO;
     }
 
+    // The import below describes one memory plane and binds one dma-buf.
+    // Multi-plane modifiers (including auxiliary compression planes) require
+    // additional layouts and potentially separate memory bindings. Reject them
+    // before Vulkan sees an incomplete image description.
+    if (gbm_bo_get_plane_count(bo) != 1) {
+        LOG_ERROR("Vulkan GBM import only supports single-plane buffers.\n");
+        gbm_bo_destroy(bo);
+        return ENOTSUP;
+    }
+
+    int support = check_import_support(renderer, vk_format, gbm_bo_get_modifier(bo), width, height);
+    if (support != 0) {
+        LOG_ERROR("GBM format/modifier cannot be imported for Vulkan rendering.\n");
+        gbm_bo_destroy(bo);
+        return support;
+    }
+
     ok = vkCreateImage(
         device,
-        &(VkImageCreateInfo){
+        &(VkImageCreateInfo) {
             .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
             .flags = 0,
             .imageType = VK_IMAGE_TYPE_2D,
@@ -257,26 +382,25 @@ fb_init(struct fb *fb, struct gbm_device *gbm_device, struct vk_renderer *render
             // modifier is probably faster if that's possible)
             .tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
             // These are the usage flags flutter will use too internally
-            .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+            .usage = fb_image_usage,
             .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
             .queueFamilyIndexCount = 0,
             .pQueueFamilyIndices = 0,
             .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
             .pNext =
-                &(VkExternalMemoryImageCreateInfo){
+                &(VkExternalMemoryImageCreateInfo) {
                     .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
                     .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
                     .pNext =
-                        &(VkImageDrmFormatModifierExplicitCreateInfoEXT){
+                        &(VkImageDrmFormatModifierExplicitCreateInfoEXT) {
                             .sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT,
                             .drmFormatModifierPlaneCount = 1,
                             .drmFormatModifier = gbm_bo_get_modifier(bo),
                             .pPlaneLayouts =
-                                (VkSubresourceLayout[1]){
+                                (VkSubresourceLayout[1]) {
                                     {
-                                        /// These are just dummy values, but they need to be there AFAIK
                                         .offset = gbm_bo_get_offset(bo, 0),
-                                        .size = gbm_bo_get_stride_for_plane(bo, 0) * gbm_bo_get_height(bo) + gbm_bo_get_offset(bo, 0),
+                                        .size = 0,  // Required by VUID-size-02267; offset/pitch describe the layout.
                                         .rowPitch = gbm_bo_get_stride_for_plane(bo, 0),
                                         .arrayPitch = 0,
                                         .depthPitch = 0,
@@ -298,7 +422,7 @@ fb_init(struct fb *fb, struct gbm_device *gbm_device, struct vk_renderer *render
     vkGetImageSubresourceLayout(
         device,
         vkimg,
-        &(VkImageSubresource){
+        &(VkImageSubresource) {
             .aspectMask = VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT,  // For v3dv, this doesn't really matter
             .mipLevel = 0,
             .arrayLayer = 0,
@@ -351,7 +475,7 @@ fb_init(struct fb *fb, struct gbm_device *gbm_device, struct vk_renderer *render
 
     vkGetImageMemoryRequirements2(
         device,
-        &(VkImageMemoryRequirementsInfo2){
+        &(VkImageMemoryRequirementsInfo2) {
             .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2,
             .image = vkimg,
             .pNext = NULL,
@@ -371,17 +495,17 @@ fb_init(struct fb *fb, struct gbm_device *gbm_device, struct vk_renderer *render
     // and we don't need to close it.
     ok = vkAllocateMemory(
         device,
-        &(VkMemoryAllocateInfo){
+        &(VkMemoryAllocateInfo) {
             .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-            .allocationSize = layout.size,
+            .allocationSize = image_memory_reqs.memoryRequirements.size,
             .memoryTypeIndex = mem,
             .pNext =
-                &(VkImportMemoryFdInfoKHR){
+                &(VkImportMemoryFdInfoKHR) {
                     .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR,
                     .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
                     .fd = fd,
                     .pNext =
-                        &(VkMemoryDedicatedAllocateInfo){
+                        &(VkMemoryDedicatedAllocateInfo) {
                             .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
                             .image = vkimg,
                             .buffer = VK_NULL_HANDLE,
@@ -400,7 +524,7 @@ fb_init(struct fb *fb, struct gbm_device *gbm_device, struct vk_renderer *render
     ok = vkBindImageMemory2(
         device,
         1,
-        &(VkBindImageMemoryInfo){
+        &(VkBindImageMemoryInfo) {
             .sType = VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_INFO,
             .image = vkimg,
             .memory = img_device_memory,
@@ -418,7 +542,7 @@ fb_init(struct fb *fb, struct gbm_device *gbm_device, struct vk_renderer *render
     fb->image = vkimg;
 
     COMPILE_ASSERT(sizeof(FlutterVulkanImage) == 24);
-    fb->fl_image = (FlutterVulkanImage){
+    fb->fl_image = (FlutterVulkanImage) {
         .struct_size = sizeof(FlutterVulkanImage),
         .image = (FlutterVulkanImageHandle) fb->image,
         .format = vk_format,
@@ -428,7 +552,7 @@ fb_init(struct fb *fb, struct gbm_device *gbm_device, struct vk_renderer *render
 
 fail_free_device_memory:
     vkFreeMemory(device, img_device_memory, NULL);
-    goto fail_destroy_bo;
+    goto fail_destroy_image;
 
 fail_close_fd:
     close(fd);
@@ -444,9 +568,9 @@ fail_destroy_bo:
 static void fb_deinit(struct fb *fb, VkDevice device) {
     ASSERT_NOT_NULL(fb);
 
+    vkDestroyImage(device, fb->image, NULL);
     vkFreeMemory(device, fb->memory, NULL);
     gbm_bo_destroy(fb->bo);
-    vkDestroyImage(device, fb->image, NULL);
 }
 
 int vk_gbm_render_surface_init(
@@ -483,8 +607,11 @@ fail_deinit_previous_fbs:
     for (int i = 0; i < ARRAY_SIZE(surface->locked_fbs); i++) {
         surface->locked_fbs[i].surface = NULL;
         surface->locked_fbs[i].is_locked = (atomic_flag) ATOMIC_FLAG_INIT;
+        atomic_init(&surface->locked_fbs[i].flutter_owned, false);
         surface->locked_fbs[i].n_refs = REFCOUNT_INIT_0;
         surface->locked_fbs[i].fb = surface->fbs + i;
+        surface->locked_fbs[i].completion_captured = false;
+        surface->locked_fbs[i].completion_fd = -1;
     }
 
     COMPILE_ASSERT(ARRAY_SIZE(surface->fbs) == ARRAY_SIZE(surface->locked_fbs));
@@ -494,6 +621,7 @@ fail_deinit_previous_fbs:
     surface->surface.deinit = vk_gbm_render_surface_deinit;
     surface->render_surface.fill = vk_gbm_render_surface_fill;
     surface->render_surface.queue_present = vk_gbm_render_surface_queue_present;
+    surface->render_surface.get_present_surface = vk_gbm_render_surface_get_present_surface;
 
 #ifdef DEBUG
     uuid_copy(&surface->uuid, uuid);
@@ -509,6 +637,7 @@ fail_deinit_previous_fbs:
     surface->render_finished_semaphore = VK_NULL_HANDLE;
     surface->get_semaphore_fd = NULL;
     surface->logged_explicit_sync_fallback = false;
+    surface->semaphore_failed = false;
     if (vk_renderer_supports_sync_fd_semaphore_export(renderer)) {
         VkDevice device = vk_renderer_get_device(renderer);
 
@@ -517,11 +646,11 @@ fail_deinit_previous_fbs:
             VkSemaphore semaphore = VK_NULL_HANDLE;
             VkResult vk_ok = vkCreateSemaphore(
                 device,
-                &(VkSemaphoreCreateInfo){
+                &(VkSemaphoreCreateInfo) {
                     .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
                     .flags = 0,
                     .pNext =
-                        &(VkExportSemaphoreCreateInfo){
+                        &(VkExportSemaphoreCreateInfo) {
                             .sType = VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO,
                             .handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
                             .pNext = NULL,
@@ -586,11 +715,20 @@ void vk_gbm_render_surface_deinit(struct surface *s) {
     struct vk_gbm_render_surface *vk_surface;
 
     vk_surface = CAST_THIS(s);
+    set_front_fb(vk_surface, NULL);
 
+    // A discarded backing store can still have GPU work in flight, regardless
+    // of whether semaphore export was available or has since been disabled.
+    // The engine resolver and runner calls use the same queue host-access lock.
+    VkResult waited = vk_queue_sync_device_wait_idle(vk_renderer_get_device(vk_surface->renderer));
+    if (waited != VK_SUCCESS && waited != VK_ERROR_DEVICE_LOST) {
+        // There is no error return from a surface destructor. Retain the GPU
+        // resources and renderer reference rather than free memory still in use.
+        LOG_VK_ERROR(waited, "Final Vulkan wait failed; retaining GPU resources for safety");
+        render_surface_deinit(s);
+        return;
+    }
     if (vk_surface->render_finished_semaphore != VK_NULL_HANDLE) {
-        // Make sure a pending signal operation on the semaphore has completed
-        // before destroying it.
-        vkDeviceWaitIdle(vk_renderer_get_device(vk_surface->renderer));
         vkDestroySemaphore(vk_renderer_get_device(vk_surface->renderer), vk_surface->render_finished_semaphore, NULL);
     }
 
@@ -598,6 +736,7 @@ void vk_gbm_render_surface_deinit(struct surface *s) {
         fb_deinit(vk_surface->fbs + i, vk_renderer_get_device(vk_surface->renderer));
     }
 
+    vk_renderer_unref(vk_surface->renderer);
     render_surface_deinit(s);
 }
 
@@ -639,7 +778,7 @@ static void on_release_layer(void *userdata) {
     surface_unref(CAST_SURFACE_UNCHECKED(surface));
 }
 
-static int vk_gbm_render_surface_present_kms(struct surface *s, const struct fl_layer_props *props, struct kms_req_builder *builder) {
+static int present_fb(struct surface *s, struct locked_fb *frame, const struct fl_layer_props *props, struct kms_req_builder *builder) {
     struct vk_gbm_render_surface *vk_surface;
     struct gbm_bo_meta *meta;
     struct drmdev *drmdev;
@@ -652,17 +791,23 @@ static int vk_gbm_render_surface_present_kms(struct surface *s, const struct fl_
     (void) props;
     (void) builder;
 
-    /// TODO: Implement non axis-aligned fl_layer_props
-    ASSERT_MSG(props->is_aa_rect, "only axis aligned view geometry is supported right now");
+    if (!props->is_aa_rect)
+        return EOPNOTSUPP;
 
     surface_lock(s);
 
+    if (frame == NULL)
+        frame = vk_surface->front_fb;
+    if (frame == NULL) {
+        ok = EINVAL;
+        goto fail_unlock;
+    }
     ASSERT_NOT_NULL_MSG(
-        vk_surface->front_fb,
+        frame,
         "There's no framebuffer available for scanout right now. Make sure you called render_surface_queue_present() before presenting."
     );
 
-    bo = vk_surface->front_fb->fb->bo;
+    bo = frame->fb->bo;
     meta = gbm_bo_get_user_data(bo);
     if (meta == NULL) {
         meta = malloc(sizeof *meta);
@@ -721,10 +866,8 @@ static int vk_gbm_render_surface_present_kms(struct surface *s, const struct fl_
     );
     */
 
-    // The bottom-most layer should preferably be an opaque layer.
-    // For example, on Pi 4, even though ARGB8888 is listed as supported for the primary plane,
-    // rendering is completely off.
-    // So we just cast our fb to an XRGB8888 framebuffer and scanout that instead.
+    // Use the actual buffer format. Reinterpreting ARGB as opaque XRGB would
+    // discard alpha that upper Flutter layers need for platform-view composition.
     fb_id = meta->fb_id;
     pixel_format = vk_surface->pixel_format;
 
@@ -733,97 +876,151 @@ static int vk_gbm_render_surface_present_kms(struct surface *s, const struct fl_
     // in implicit dma-resv synchronization, so hand KMS an explicit
     // render-completion fence:
     //
-    // The engine has already submitted all rendering commands for this frame
-    // to our graphics queue (this runs inside the present_layers engine
-    // callback, on the raster thread, after the engine flushed & submitted
-    // its work). Submit an empty batch that signals our exportable binary
+    // The engine must submit rendering before presenting its backing store.
+    // This path also runs for platform-thread repaints, not just raster-thread
+    // presentation. The shared Vulkan dispatch wrapper serializes this with
+    // engine queue access; the surface mutex alone would not be sufficient.
+    // Submit an empty batch that signals our exportable binary
     // semaphore -- queue submission order guarantees it signals only after
     // all previously submitted work has completed -- then export the payload
     // as a sync-file fd and attach it to the KMS plane as IN_FENCE_FD.
     //
     // If that's unsupported (or fails), fall back to a full device wait.
     int in_fence_fd = -1;
-    if (vk_surface->render_finished_semaphore != VK_NULL_HANDLE) {
-        VkResult vk_ok;
+    if (!frame->completion_captured) {
+        bool render_complete = false;
+        if (vk_surface->render_finished_semaphore != VK_NULL_HANDLE && !vk_surface->semaphore_failed) {
+            VkResult vk_ok;
 
-        TRACER_BEGIN(vk_surface->surface.tracer, "export render-completion fence");
-        vk_ok = vkQueueSubmit(
-            vk_renderer_get_queue(vk_surface->renderer),
-            1,
-            &(VkSubmitInfo){
-                .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-                .waitSemaphoreCount = 0,
-                .commandBufferCount = 0,
-                .signalSemaphoreCount = 1,
-                .pSignalSemaphores = (VkSemaphore[1]){ vk_surface->render_finished_semaphore },
-                .pNext = NULL,
-            },
-            VK_NULL_HANDLE
-        );
-        if (vk_ok == VK_SUCCESS) {
-            vk_ok = vk_surface->get_semaphore_fd(
-                vk_renderer_get_device(vk_surface->renderer),
-                &(VkSemaphoreGetFdInfoKHR){
-                    .sType = VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR,
-                    .semaphore = vk_surface->render_finished_semaphore,
-                    .handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
+            TRACER_BEGIN(vk_surface->surface.tracer, "export render-completion fence");
+            vk_ok = vk_queue_sync_submit(
+                vk_renderer_get_queue(vk_surface->renderer),
+                1,
+                &(VkSubmitInfo) {
+                    .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                    .waitSemaphoreCount = 0,
+                    .commandBufferCount = 0,
+                    .signalSemaphoreCount = 1,
+                    .pSignalSemaphores = (VkSemaphore[1]) { vk_surface->render_finished_semaphore },
                     .pNext = NULL,
                 },
-                &in_fence_fd
+                VK_NULL_HANDLE
             );
-            if (vk_ok != VK_SUCCESS) {
-                in_fence_fd = -1;
+            if (vk_ok == VK_SUCCESS) {
+                vk_ok = vk_surface->get_semaphore_fd(
+                    vk_renderer_get_device(vk_surface->renderer),
+                    &(VkSemaphoreGetFdInfoKHR) {
+                        .sType = VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR,
+                        .semaphore = vk_surface->render_finished_semaphore,
+                        .handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
+                        .pNext = NULL,
+                    },
+                    &in_fence_fd
+                );
+                if (vk_ok == VK_SUCCESS) {
+                    // -1 is a successful, already-signaled SYNC_FD payload.
+                    render_complete = true;
+                } else {
+                    vk_surface->semaphore_failed = true;  // failed export did not consume the signal
+                    in_fence_fd = -1;
+                    if (!vk_surface->logged_explicit_sync_fallback) {
+                        vk_surface->logged_explicit_sync_fallback = true;
+                        LOG_VK_ERROR(vk_ok, "Couldn't export render-completion fence, waiting for device idle instead. vkGetSemaphoreFdKHR");
+                    }
+                }
+            } else {
+                vk_surface->semaphore_failed = true;
                 if (!vk_surface->logged_explicit_sync_fallback) {
                     vk_surface->logged_explicit_sync_fallback = true;
-                    LOG_VK_ERROR(vk_ok, "Couldn't export render-completion fence, waiting for device idle instead. vkGetSemaphoreFdKHR");
+                    LOG_VK_ERROR(vk_ok, "Couldn't submit render-completion fence signal, waiting for device idle instead. vkQueueSubmit");
                 }
             }
-        } else if (!vk_surface->logged_explicit_sync_fallback) {
-            vk_surface->logged_explicit_sync_fallback = true;
-            LOG_VK_ERROR(vk_ok, "Couldn't submit render-completion fence signal, waiting for device idle instead. vkQueueSubmit");
+            TRACER_END(vk_surface->surface.tracer, "export render-completion fence");
         }
-        TRACER_END(vk_surface->surface.tracer, "export render-completion fence");
-    }
 
-    if (in_fence_fd < 0) {
-        TRACER_BEGIN(vk_surface->surface.tracer, "vkDeviceWaitIdle");
-        vkDeviceWaitIdle(vk_renderer_get_device(vk_surface->renderer));
-        TRACER_END(vk_surface->surface.tracer, "vkDeviceWaitIdle");
+        if (!render_complete) {
+            TRACER_BEGIN(vk_surface->surface.tracer, "vkDeviceWaitIdle");
+            VkResult wait_result = vk_queue_sync_device_wait_idle(vk_renderer_get_device(vk_surface->renderer));
+            TRACER_END(vk_surface->surface.tracer, "vkDeviceWaitIdle");
+            if (wait_result != VK_SUCCESS) {
+                LOG_VK_ERROR(wait_result, "Render-completion wait failed; not presenting image");
+                ok = EIO;
+                goto fail_unlock;
+            }
+            if (vk_surface->semaphore_failed && vk_surface->render_finished_semaphore != VK_NULL_HANDLE) {
+                // Idle completes the pending signal but does not unsignal a binary
+                // semaphore. Retire it and use the checked idle fallback thereafter.
+                vkDestroySemaphore(vk_renderer_get_device(vk_surface->renderer), vk_surface->render_finished_semaphore, NULL);
+                vk_surface->render_finished_semaphore = VK_NULL_HANDLE;
+                vk_surface->get_semaphore_fd = NULL;
+            }
+        }
+
+        frame->completion_fd = in_fence_fd;
+        frame->completion_captured = true;
+    }
+    // KMS owns a distinct fd. The retained payload is reusable for repaints and
+    // survives a rejected KMS request; closing one request cannot invalidate it.
+    in_fence_fd = frame->completion_fd >= 0 ? fcntl(frame->completion_fd, F_DUPFD_CLOEXEC, 0) : -1;
+    if (frame->completion_fd >= 0 && in_fence_fd < 0) {
+        ok = errno;
+        goto fail_unlock;
     }
 
     TRACER_BEGIN(vk_surface->surface.tracer, "kms_req_builder_push_fb_layer");
-    ok = kms_req_builder_push_fb_layer(
-        builder,
-        &(const struct kms_fb_layer){
-            .drm_fb_id = fb_id,
-            .format = pixel_format,
-            .has_modifier = true,
-            .modifier = gbm_bo_get_modifier(bo),
+    locked_fb_ref(frame);
+    for (;;) {
+        ok = kms_req_builder_push_fb_layer(
+            builder,
+            &(const struct kms_fb_layer) {
+                .drm_fb_id = fb_id,
+                .format = pixel_format,
+                .has_modifier = true,
+                .modifier = gbm_bo_get_modifier(bo),
 
-            .dst_x = (int32_t) props->aa_rect.offset.x,
-            .dst_y = (int32_t) props->aa_rect.offset.y,
-            .dst_w = (uint32_t) props->aa_rect.size.x,
-            .dst_h = (uint32_t) props->aa_rect.size.y,
+                .dst_x = (int32_t) props->aa_rect.offset.x,
+                .dst_y = (int32_t) props->aa_rect.offset.y,
+                .dst_w = (uint32_t) props->aa_rect.size.x,
+                .dst_h = (uint32_t) props->aa_rect.size.y,
 
-            .src_x = 0,
-            .src_y = 0,
-            .src_w = DOUBLE_TO_FP1616_ROUNDED(vk_surface->render_surface.size.x),
-            .src_h = DOUBLE_TO_FP1616_ROUNDED(vk_surface->render_surface.size.y),
+                .src_x = 0,
+                .src_y = 0,
+                .src_w = DOUBLE_TO_FP1616_ROUNDED(vk_surface->render_surface.size.x),
+                .src_h = DOUBLE_TO_FP1616_ROUNDED(vk_surface->render_surface.size.y),
 
-            // see egl_gbm_render_surface_present_kms
-            .has_rotation = true,
-            .rotation = PLANE_TRANSFORM_ROTATE_0,
-            .enforce_rotation = false,
+                // see egl_gbm_render_surface_present_kms
+                .has_rotation = true,
+                .rotation = PLANE_TRANSFORM_ROTATE_0,
+                .enforce_rotation = false,
 
-            // On success, the KMS request takes ownership of the fd.
-            .has_in_fence_fd = in_fence_fd >= 0,
-            .in_fence_fd = in_fence_fd,
-        },
-        on_release_layer,
-        NULL,
-        locked_fb_ref(vk_surface->front_fb),
-        NULL
-    );
+                // On success, the KMS request takes ownership of the fd.
+                .has_in_fence_fd = in_fence_fd >= 0,
+                .in_fence_fd = in_fence_fd,
+            },
+            on_release_layer,
+            NULL,
+            frame,
+            NULL
+        );
+        if (ok != EOPNOTSUPP || in_fence_fd < 0)
+            break;
+        // Wait only for this image, not all unrelated work on the engine queue.
+        // poll() does not access VkQueue and also works on repaints to a plane
+        // that cannot accept IN_FENCE_FD.
+        struct pollfd pfd = { .fd = in_fence_fd, .events = POLLIN };
+        int result;
+        do {
+            result = poll(&pfd, 1, -1);
+        } while (result < 0 && errno == EINTR);
+        close(in_fence_fd);
+        in_fence_fd = -1;
+        if (result <= 0 || !(pfd.revents & POLLIN) || (pfd.revents & (POLLERR | POLLNVAL))) {
+            ok = EIO;
+            break;
+        }
+        reset_completion(frame);
+        frame->completion_captured = true;  // the retained fence has now completed
+    }
     TRACER_END(vk_surface->surface.tracer, "kms_req_builder_push_fb_layer");
     if (ok != 0) {
         if (in_fence_fd >= 0) {
@@ -836,7 +1033,7 @@ static int vk_gbm_render_surface_present_kms(struct surface *s, const struct fl_
     return ok;
 
 fail_unref_locked_fb:
-    locked_fb_unref(vk_surface->front_fb);
+    locked_fb_unref(frame);
     goto fail_unlock;
 
 fail_free_meta:
@@ -847,21 +1044,65 @@ fail_unlock:
     return ok;
 }
 
+static int vk_gbm_render_surface_present_kms(struct surface *s, const struct fl_layer_props *props, struct kms_req_builder *builder) {
+    return present_fb(s, NULL, props, builder);
+}
+
+// A composition must retain image identity, not a pointer to a mutable "latest
+// frame" surface shared by all backing-store layers and subsequent repaints.
+struct vk_frame_surface {
+    struct surface surface;
+    struct locked_fb *frame;
+};
+static int frame_present_kms(struct surface *s, const struct fl_layer_props *props, struct kms_req_builder *builder) {
+    struct vk_frame_surface *frame = (void *) s;
+    return present_fb(CAST_SURFACE(frame->frame->surface), frame->frame, props, builder);
+}
+static void frame_deinit(struct surface *s) {
+    struct vk_frame_surface *frame = (void *) s;
+    locked_fb_unref(frame->frame);
+    surface_deinit(s);
+}
+static struct surface *vk_gbm_render_surface_get_present_surface(struct render_surface *s, const FlutterBackingStore *store) {
+    struct vk_gbm_render_surface *owner = CAST_THIS(s);
+    struct vk_frame_surface *snapshot = malloc(sizeof(*snapshot));
+    if (!snapshot)
+        return NULL;
+    surface_lock(&s->surface);
+    struct locked_fb *fb = NULL;
+    for (int i = 0; i < ARRAY_SIZE(owner->locked_fbs); i++) {
+        if (owner->fbs[i].fl_image.image == store->vulkan.image->image && owner->locked_fbs[i].surface == owner) {
+            fb = &owner->locked_fbs[i];
+            break;
+        }
+    }
+    if (!fb || surface_init(&snapshot->surface, s->surface.tracer) != 0) {
+        surface_unlock(&s->surface);
+        free(snapshot);
+        return NULL;
+    }
+    snapshot->frame = locked_fb_ref(fb);
+    snapshot->surface.deinit = frame_deinit;
+    snapshot->surface.present_kms = frame_present_kms;
+    snapshot->surface.present_fbdev = vk_gbm_render_surface_present_fbdev;
+    surface_unlock(&s->surface);
+    return &snapshot->surface;
+}
+
 static int
 vk_gbm_render_surface_present_fbdev(struct surface *s, const struct fl_layer_props *props, struct fbdev_commit_builder *builder) {
-    struct vk_gbm_render_surface *render_surface;
-
-    /// TODO: Implement by mmapping the current front bo, copy it into the fbdev
-    /// TODO: Print a warning here if we're not using explicit linear tiling and transition to linear layout with vulkan instead of gbm_bo_map in that case
-
-    render_surface = CAST_THIS(s);
-    (void) render_surface;
+    (void) s;
     (void) props;
     (void) builder;
+    return EOPNOTSUPP;
+}
 
-    UNIMPLEMENTED();
-
-    return 0;
+static void on_flutter_release_backing_store(void *userdata) {
+    struct locked_fb *fb = userdata;
+    // This also covers a store discarded before present_layers. Presentation
+    // takes its own front-buffer reference; it must not consume Flutter's ref.
+    atomic_store_explicit(&fb->flutter_owned, false, memory_order_relaxed);
+    locked_fb_unref(fb);
 }
 
 static int vk_gbm_render_surface_fill(struct render_surface *s, FlutterBackingStore *fl_store) {
@@ -881,14 +1122,26 @@ static int vk_gbm_render_surface_fill(struct render_surface *s, FlutterBackingSt
         }
     }
 
-    // If we reached this point, we couldn't lock one of the 4 locked_fbs.
-    // Which shouldn't happen except we have an application bug.
-    ASSERT_MSG(false, "Couldn't find a free slot to lock the surfaces front framebuffer.");
-    ok = EIO;
+    // This is pool pressure, not a failed Vulkan/GBM allocation. Do not reuse a
+    // live image or assert in Debug: Flutter may still own unpresented stores,
+    // and KMS may hold the current, in-flight and queued frames independently.
+    LOG_ERROR("Vulkan backing-store pool exhausted (%dx%d, %zu slots).\n", s->size.x, s->size.y, ARRAY_SIZE(render_surface->locked_fbs));
+    for (int slot = 0; slot < ARRAY_SIZE(render_surface->locked_fbs); slot++) {
+        struct locked_fb *fb = &render_surface->locked_fbs[slot];
+        // Counts can change concurrently as engine/KMS callbacks retire refs.
+        LOG_ERROR(
+            "  slot %d: refs=%d flutter=%d front=%d\n",
+            slot,
+            refcount_get_for_debug(&fb->n_refs),
+            atomic_load_explicit(&fb->flutter_owned, memory_order_relaxed),
+            render_surface->front_fb == fb
+        );
+    }
+    ok = EAGAIN;
     goto fail_unlock;
 
 locked:;
-/// TODO: Remove this once we're using triple buffering
+    reset_completion(&render_surface->locked_fbs[i]);
 #ifdef DEBUG
     atomic_fetch_add(&render_surface->n_locked_fbs, 1);
     log_locked_fbs(CAST_THIS_UNCHECKED(s), "fill");
@@ -896,14 +1149,15 @@ locked:;
 #endif
     render_surface->locked_fbs[i].surface = CAST_VK_GBM_RENDER_SURFACE(surface_ref(CAST_SURFACE_UNCHECKED(s)));
     render_surface->locked_fbs[i].n_refs = REFCOUNT_INIT_1;
+    atomic_store_explicit(&render_surface->locked_fbs[i].flutter_owned, true, memory_order_relaxed);
 
     COMPILE_ASSERT(sizeof(FlutterVulkanBackingStore) == 16 || sizeof(FlutterVulkanBackingStore) == 32);
     fl_store->type = kFlutterBackingStoreTypeVulkan;
-    fl_store->vulkan = (FlutterVulkanBackingStore){
+    fl_store->vulkan = (FlutterVulkanBackingStore) {
         .struct_size = sizeof(FlutterVulkanBackingStore),
         .image = &render_surface->locked_fbs[i].fb->fl_image,
-        .user_data = surface_ref(CAST_SURFACE_UNCHECKED(render_surface)),
-        .destruction_callback = surface_unref_void,
+        .user_data = &render_surface->locked_fbs[i],
+        .destruction_callback = on_flutter_release_backing_store,
     };
 
     surface_unlock(CAST_SURFACE_UNCHECKED(s));
@@ -922,7 +1176,6 @@ static int vk_gbm_render_surface_queue_present(struct render_surface *s, const F
     vk_surface = CAST_THIS(s);
 
     ASSERT_EQUALS(fl_store->type, kFlutterBackingStoreTypeVulkan);
-    /// TODO: Implement handling if fl_store->did_update == false
 
     surface_lock(CAST_SURFACE_UNCHECKED(s));
 
@@ -941,12 +1194,17 @@ static int vk_gbm_render_surface_queue_present(struct render_surface *s, const F
         return EINVAL;
     }
 
+    // A reused engine store may contain new rendering even without a new fill.
+    // Already-submitted KMS requests own their own copies of the old fence.
+    if (fl_store->did_update)
+        reset_completion(fb);
+
     // Replace the front fb with the new one
     // (will unref the old one if not NULL internally)
-    locked_fb_swap_ptrs(&vk_surface->front_fb, fb);
+    set_front_fb(vk_surface, fb);
 
-    // Since flutter no longer uses this fb for rendering, we need to unref it
-    locked_fb_unref(fb);
+    // Flutter's reference is released only by its destruction callback, not
+    // here: a store may be presented more than once or discarded unpresented.
 
     log_locked_fbs(vk_surface, "queue_present");
 

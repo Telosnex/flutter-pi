@@ -238,6 +238,7 @@ if (ENABLE_VULKAN)
     target_sources(flutterpi_module PRIVATE
       src/vk_gbm_render_surface.c
       src/vk_renderer.c
+      src/vk_queue_sync.c
     )
     target_link_libraries(flutterpi_module PUBLIC
       PkgConfig::VULKAN
@@ -416,7 +417,7 @@ target_link_options(flutterpi_module PUBLIC -rdynamic)
 
 # Define VULKAN_DEBUG if it was set to On, or if it was set to AUTO and we're using debug mode.
 if (VULKAN_DEBUG MATCHES AUTO)
-  if (CMAKE_BUILD_TYPE MATCHES DEBUG)
+  if (CMAKE_BUILD_TYPE STREQUAL "Debug")
     set(VULKAN_DEBUG ON)
   else()
     set(VULKAN_DEBUG OFF)

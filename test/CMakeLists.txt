@@ -100,3 +100,15 @@ if(WPEWEBKIT_FOUND AND LIBGSTREAMER_GL_FOUND)
     target_compile_definitions(webview_completion_test PRIVATE $<TARGET_PROPERTY:flutterpi_module,COMPILE_DEFINITIONS>)
     add_test(NAME webview_completion_test COMMAND webview_completion_test)
 endif()
+
+if(HAVE_VULKAN)
+    add_executable(vulkan_backing_store_test vulkan_backing_store_test.c)
+    target_link_libraries(vulkan_backing_store_test lifecycle_test_support Unity)
+    set_property(TARGET vulkan_backing_store_test PROPERTY INTERPROCEDURAL_OPTIMIZATION FALSE)
+    add_test(NAME vulkan_backing_store_test COMMAND vulkan_backing_store_test)
+endif()
+
+# Fault-injection regressions and an opt-in real-driver smoke executable.
+if(HAVE_VULKAN)
+    add_subdirectory(vulkan_audit)
+endif()

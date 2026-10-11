@@ -6,6 +6,7 @@
  */
 
 #include "vk_renderer.h"
+#include "vk_queue_sync.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -66,7 +67,7 @@ static VkBool32 on_debug_utils_message(
         data->cmdBufLabelCount,
         data->objectCount
     );
-    return VK_TRUE;
+    return VK_FALSE;
 }
 
 static int get_graphics_queue_family_index(VkPhysicalDevice device) {
@@ -97,6 +98,10 @@ static int score_physical_device(VkPhysicalDevice device, const char **required_
     vkGetPhysicalDeviceProperties(device, &props);
     vkGetPhysicalDeviceFeatures(device, &features);
 
+    if (props.apiVersion < VK_MAKE_VERSION(1, 1, 0)) {
+        return 0;
+    }
+
     if (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) {
         score += 15;
     } else if (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) {
@@ -115,7 +120,9 @@ static int score_physical_device(VkPhysicalDevice device, const char **required_
         return 0;
     }
 
-    VkExtensionProperties available_extensions[n_available_extensions];
+    // Zero extensions is valid, but a zero-length VLA is not. Keep storage
+    // nonempty while leaving the actual count zero for the capability checks.
+    VkExtensionProperties available_extensions[n_available_extensions ? n_available_extensions : 1];
     ok = vkEnumerateDeviceExtensionProperties(device, NULL, &n_available_extensions, available_extensions);
     if (ok != 0) {
         LOG_VK_ERROR(ok, "Could not query available physical device extensions. vkEnumerateDeviceExtensionProperties");
@@ -197,7 +204,7 @@ MUST_CHECK struct vk_renderer *vk_renderer_new() {
     }
 
     n_enabled_layers = 0;
-    enabled_layers = malloc(n_available_layers * sizeof(*enabled_layers));
+    enabled_layers = malloc((n_available_layers ? n_available_layers : 1) * sizeof(*enabled_layers));
     if (enabled_layers == NULL) {
         goto fail_free_renderer;
     }
@@ -225,7 +232,8 @@ MUST_CHECK struct vk_renderer *vk_renderer_new() {
     }
 
     n_enabled_instance_extensions = 0;
-    enabled_instance_extensions = malloc(n_available_instance_extensions * sizeof *enabled_instance_extensions);
+    enabled_instance_extensions =
+        malloc((n_available_instance_extensions ? n_available_instance_extensions : 1) * sizeof *enabled_instance_extensions);
     if (enabled_instance_extensions == NULL) {
         goto fail_free_enabled_layers;
     }
@@ -427,6 +435,13 @@ MUST_CHECK struct vk_renderer *vk_renderer_new() {
 
     vkGetDeviceQueue(device, graphics_queue_family_index, 0, &graphics_queue);
 
+    int sync_error = vk_queue_sync_register(device, graphics_queue);
+    if (sync_error != 0) {
+        LOG_ERROR("Couldn't register synchronized Vulkan queue: %s\n", strerror(sync_error));
+        goto fail_destroy_device;
+    }
+
+
     ok = vkCreateCommandPool(
         device,
         &(const VkCommandPoolCreateInfo){
@@ -440,6 +455,7 @@ MUST_CHECK struct vk_renderer *vk_renderer_new() {
     );
     if (ok != VK_SUCCESS) {
         LOG_VK_ERROR(ok, "Could not create command pool for allocating graphics command buffers. vkCreateCommandPool");
+        vk_queue_sync_unregister(device);
         goto fail_destroy_device;
     }
 
@@ -476,6 +492,7 @@ MUST_CHECK struct vk_renderer *vk_renderer_new() {
         "===================================\n"
     );
 
+    renderer->n_refs = REFCOUNT_INIT_1;
     renderer->device = device;
     renderer->physical_device = physical_device;
     renderer->instance = instance;
@@ -520,11 +537,13 @@ fail_free_renderer:
 void vk_renderer_destroy(struct vk_renderer *renderer) {
     VkResult ok;
 
-    ok = vkDeviceWaitIdle(renderer->device);
+    ok = vk_queue_sync_device_wait_idle(renderer->device);
     if (ok != VK_SUCCESS) {
         LOG_VK_ERROR(ok, "Couldn't wait for vulkan device idle to destroy it. vkDeviceWaitIdle");
     }
 
+    // Engine shutdown and all surface releases precede the final renderer ref.
+    vk_queue_sync_unregister(renderer->device);
     vkDestroyCommandPool(renderer->device, renderer->graphics_cmd_pool, NULL);
     vkDestroyDevice(renderer->device, NULL);
     free(renderer->enabled_device_extensions);
@@ -617,7 +636,7 @@ ATTR_PURE int vk_renderer_find_mem_type(struct vk_renderer *renderer, VkMemoryPr
     vkGetPhysicalDeviceMemoryProperties(renderer->physical_device, &props);
 
     for (unsigned i = 0u; i < props.memoryTypeCount; ++i) {
-        if (req_bits & (1 << i)) {
+        if (req_bits & (UINT32_C(1) << i)) {
             if ((props.memoryTypes[i].propertyFlags & flags) == flags) {
                 return i;
             }

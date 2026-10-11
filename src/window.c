@@ -1464,7 +1464,10 @@ static struct render_surface *kms_window_get_render_surface_internal(struct wind
     ASSERT_NOT_NULL(window);
 
     if (window->render_surface != NULL) {
-        return window->render_surface;
+        struct vec2i cached_size = render_surface_get_size(window->render_surface);
+        if (!has_size || (cached_size.x == size.x && cached_size.y == size.y)) {
+            return window->render_surface;
+        }
     }
 
     if (!has_size) {
@@ -1533,7 +1536,16 @@ static struct render_surface *kms_window_get_render_surface_internal(struct wind
             drm_plane_for_each_modified_format(plane, count_modifiers_for_pixel_format, &context);
 
             n_allowed_modifiers = context.n_modifiers;
+            if (n_allowed_modifiers == 0) {
+                // This plane does not advertise modifiers for our format.
+                continue;
+            }
             allowed_modifiers = calloc(n_allowed_modifiers, sizeof(*context.modifiers));
+            if (allowed_modifiers == NULL) {
+                LOG_ERROR("Couldn't allocate rendering surface modifiers.\n");
+                // Do not replace the cached surface on allocation failure.
+                return NULL;
+            }
             context.modifiers = allowed_modifiers;
 
             // Next, fill context.modifiers with the allowed modifiers.
@@ -1592,7 +1604,11 @@ static struct render_surface *kms_window_get_render_surface_internal(struct wind
         free(allowed_modifiers);
     }
 
-    window->render_surface = render_surface;
+    if (render_surface != NULL) {
+        struct render_surface *old = window->render_surface;
+        window->render_surface = render_surface;
+        if (old != NULL) surface_unref(CAST_SURFACE(old));
+    }
     return render_surface;
 }
 

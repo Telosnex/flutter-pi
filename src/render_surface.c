@@ -47,6 +47,7 @@ int render_surface_init(struct render_surface *surface, struct tracer *tracer, s
     surface->size = size;
     surface->fill = NULL;
     surface->queue_present = NULL;
+    surface->get_present_surface = NULL;
     return 0;
 }
 
@@ -97,3 +98,11 @@ ATTR_PURE struct render_surface *__checked_cast_render_surface(void *ptr) {
     return surface;
 }
 #endif
+
+struct vec2i render_surface_get_size(struct render_surface *s) {
+    return s->size;
+}
+
+struct surface *render_surface_get_present_surface(struct render_surface *s, const FlutterBackingStore *store) {
+    return s->get_present_surface ? s->get_present_surface(s, store) : surface_ref(&s->surface);
+}
