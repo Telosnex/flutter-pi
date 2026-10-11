@@ -3,10 +3,11 @@
  * WPE WebKit webviews driven directly through the WPEPlatform API, with no
  * GStreamer pipeline in between.
  *
- * WebKit runs on one shared thread. Each frame arrives as a DMA-BUF, is copied
- * on the GPU into a flutter-pi scanout buffer (webview_gpu), and is handed
- * back to WebKit right away. Nothing outside the WebKit thread ever holds a
- * WebKit buffer, so closing a view cannot leave one behind.
+ * WebKit runs on one shared thread. Frames arrive as DMA-BUFs for direct
+ * scanout, with a GPU-copy fallback. Frame acknowledgement is flip-paced;
+ * releasing the buffer is separate and waits until KMS retires it. Display
+ * holds can outlive a closed view, but their WPE objects are released only on
+ * the WebKit thread. Closing a view does not forcibly terminate its process.
  *
  * Opt-in with FLUTTERPI_WEBVIEW_DIRECT=1; needs the plane and GPU paths too.
  */
@@ -37,6 +38,9 @@ bool webview_direct_requested(void);
 bool webview_direct_parse_pipeline(const char *description, char **location_out, int *width_out, int *height_out);
 
 /// Creates a view and starts loading @location. Blocks until the view exists.
+/// Borrows gpu, surface and compositor until destroy returns. After stopping
+/// the producer, the owner must clear/unregister/unref its surface separately;
+/// in-flight display buffers keep their own independent references.
 struct webview_direct *webview_direct_new(
     struct webview_gpu *gpu,
     struct dmabuf_surface *surface,

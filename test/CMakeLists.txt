@@ -87,3 +87,16 @@ target_sources(surface_lifecycle_test PRIVATE
     ${PROJECT_SOURCE_DIR}/src/dmabuf_surface.c
     ${PROJECT_SOURCE_DIR}/src/compositor_ng.c
 )
+
+if(WPEWEBKIT_FOUND AND LIBGSTREAMER_GL_FOUND)
+    add_executable(webview_completion_test
+        webview_completion_test.c
+        ${PROJECT_SOURCE_DIR}/src/plugins/gstreamer_video_player/webview_gpu.c
+    )
+    target_link_libraries(webview_completion_test Unity $<TARGET_PROPERTY:flutterpi_module,LINK_LIBRARIES>)
+    target_link_options(webview_completion_test PRIVATE $<TARGET_PROPERTY:flutterpi_module,LINK_OPTIONS>)
+    target_include_directories(webview_completion_test PRIVATE $<TARGET_PROPERTY:flutterpi_module,INCLUDE_DIRECTORIES>)
+    target_compile_options(webview_completion_test PRIVATE $<TARGET_PROPERTY:flutterpi_module,COMPILE_OPTIONS>)
+    target_compile_definitions(webview_completion_test PRIVATE $<TARGET_PROPERTY:flutterpi_module,COMPILE_DEFINITIONS>)
+    add_test(NAME webview_completion_test COMMAND webview_completion_test)
+endif()

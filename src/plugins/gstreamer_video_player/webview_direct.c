@@ -40,6 +40,8 @@
             LOG_ERROR_UNPREFIXED("webview direct: " fmtstring, ##__VA_ARGS__);      \
     } while (0)
 
+struct frame_completion;
+
 struct webview_direct {
     gatomicrefcount n_refs;
 
@@ -72,6 +74,7 @@ struct webview_direct {
     /// the display lets go of it.
     bool waiting_on_screen;
     GSource *waiting_timeout;
+    struct frame_completion *waiting_completion;
 
     // Latest coalesced pointer move, guarded by move_lock.
     GMutex move_lock;
@@ -328,38 +331,64 @@ static bool present_frame(struct webview_direct *view, WPEBuffer *buffer) {
     return false;
 }
 
+// A unique completion token, with separate waiting-frame and callback owners.
+// Late callbacks compare token identity, never "finish the current frame".
+// It holds only the view state, not a displayed buffer or a borrowed surface.
+struct frame_completion {
+    gatomicrefcount n_refs;
+    struct webview_direct *view;
+};
+
+static void completion_unref(void *userdata) {
+    struct frame_completion *completion = userdata;
+    if (g_atomic_ref_count_dec(&completion->n_refs)) {
+        view_unref(completion->view);
+        free(completion);
+    }
+}
+
+static void on_frame_scanout(void *userdata);
+
 /// Hands the waiting frame back to WebKit, letting it start the next one.
 /// WebKit thread.
 static void finish_waiting_frame(struct webview_direct *view) {
     WPEBuffer *buffer = view->waiting_buffer;
+    struct frame_completion *completion = view->waiting_completion;
+    bool on_screen = view->waiting_on_screen;
+    view->waiting_buffer = NULL;
+    view->waiting_completion = NULL;
+    view->waiting_on_screen = false;
+    if (completion != NULL && compositor_cancel_repaint(view->compositor, on_frame_scanout, completion)) {
+        completion_unref(completion);  // Callback removed; release its reference.
+    }
     if (view->waiting_timeout != NULL) {
         g_source_destroy(view->waiting_timeout);
         g_source_unref(view->waiting_timeout);
         view->waiting_timeout = NULL;
     }
-    if (buffer == NULL) return;
-    view->waiting_buffer = NULL;
+    if (buffer == NULL)
+        return;
     if (view->wpe_view != NULL) {
         wpe_view_buffer_rendered(view->wpe_view, buffer);
         // A scanned-out buffer is released when the display lets go of it.
-        if (!view->waiting_on_screen) wpe_view_buffer_released(view->wpe_view, buffer);
+        if (!on_screen)
+            wpe_view_buffer_released(view->wpe_view, buffer);
     }
-    view->waiting_on_screen = false;
     g_object_unref(buffer);
+    if (completion != NULL)
+        completion_unref(completion);  // Waiting-frame owner.
 }
 
 static gboolean finish_on_thread(void *userdata) {
-    finish_waiting_frame(userdata);
+    struct frame_completion *completion = userdata;
+    if (completion->view->waiting_completion == completion)
+        finish_waiting_frame(completion->view);
     return G_SOURCE_REMOVE;
-}
-
-static void destroy_view_ref(void *userdata) {
-    view_unref(userdata);
 }
 
 /// Display thread, at the page flip after the frame was committed.
 static void on_frame_scanout(void *userdata) {
-    g_main_context_invoke_full(webkit_context(), G_PRIORITY_HIGH, finish_on_thread, userdata, destroy_view_ref);
+    g_main_context_invoke_full(webkit_context(), G_PRIORITY_HIGH, finish_on_thread, userdata, completion_unref);
 }
 
 /// Safety net if no flip comes (display off, commit failed early).
@@ -369,6 +398,26 @@ static gboolean on_frame_timeout(void *userdata) {
     // REMOVE afterwards is fine.
     finish_waiting_frame(view);
     return G_SOURCE_REMOVE;
+}
+
+static void wait_for_frame(struct webview_direct *view, WPEBuffer *buffer, bool on_screen) {
+    view->waiting_buffer = g_object_ref(buffer);
+    view->waiting_on_screen = on_screen;
+    struct frame_completion *completion = g_new0(struct frame_completion, 1);
+    g_atomic_ref_count_init(&completion->n_refs);  // Waiting-frame reference.
+    completion->view = view_ref(view);
+    view->waiting_completion = completion;
+    view->waiting_timeout = g_timeout_source_new(100);
+    g_source_set_callback(view->waiting_timeout, on_frame_timeout, view, NULL);
+    g_source_attach(view->waiting_timeout, webkit_context());
+
+    // Prepare ALL state first: a failed commit may invoke the callback inline.
+    g_atomic_ref_count_inc(&completion->n_refs);  // Callback reference.
+    if (compositor_request_repaint(view->compositor, on_frame_scanout, completion) != 0) {
+        // Error guarantees no callback. Drop its reference, then finish now.
+        completion_unref(completion);
+        finish_waiting_frame(view);
+    }
 }
 
 static gboolean flutterpi_wpe_view_render_buffer(
@@ -400,17 +449,7 @@ static gboolean flutterpi_wpe_view_render_buffer(
     // WebKit to the display instead of letting it draw hundreds of frames a
     // second that are never shown. The repaint also puts the frame on screen
     // when Flutter itself is idle. Only this thread holds WebKit buffers.
-    view->waiting_buffer = g_object_ref(buffer);
-    view->waiting_on_screen = on_screen;
-    if (compositor_request_repaint(view->compositor, on_frame_scanout, view_ref(view)) != 0) {
-        // No listener was registered (nothing composited yet, or no KMS).
-        view_unref(view);
-        finish_waiting_frame(view);
-        return TRUE;
-    }
-    view->waiting_timeout = g_timeout_source_new(100);
-    g_source_set_callback(view->waiting_timeout, on_frame_timeout, view, NULL);
-    g_source_attach(view->waiting_timeout, webkit_context());
+    wait_for_frame(view, buffer, on_screen);
     return TRUE;
 }
 
@@ -760,8 +799,8 @@ static gboolean destroy_on_thread(void *userdata) {
 
     // After this, render_buffer still returns buffers to WebKit but no longer
     // touches the surface, and no signal reaches the owner's userdata.
-    finish_waiting_frame(view);
     ((FlutterpiWpeView *) view->wpe_view)->owner = NULL;
+    finish_waiting_frame(view);
     manager = webkit_web_view_get_user_content_manager(web_view);
     if (view->userdata != NULL) {
         g_signal_handlers_disconnect_by_data(web_view, view->userdata);
