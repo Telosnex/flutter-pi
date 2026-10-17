@@ -22,6 +22,18 @@ target_link_libraries(
 
 add_test(flutterpi_test flutterpi_test)
 
+add_executable(display_wait_test
+    display_wait_test.c
+)
+
+target_link_libraries(
+    display_wait_test
+    flutterpi_module
+    Unity
+)
+
+add_test(display_wait_test display_wait_test)
+
 add_executable(frame_scheduler_test
     frame_scheduler_test.c
 )
