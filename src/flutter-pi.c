@@ -41,6 +41,7 @@
 #include <xf86drmMode.h>
 
 #include "compositor_ng.h"
+#include "display_wait.h"
 #include "filesystem_layout.h"
 #include "frame_scheduler.h"
 #include "keyboard.h"
@@ -149,6 +150,10 @@ OPTIONS:\n\
                              in pixels.\n\
 \n\
   --drm-fd                   An opened and valid DRM file descriptor\n\
+\n\
+  --wait-for-display         If a GPU is present but no display is connected,\n\
+                             wait for one to be connected instead of exiting.\n\
+                             Has no effect with --dummy-display or --drm-fd.\n\
 \n\
   -h, --help                 Show this help and exit.\n\
 \n\
@@ -1927,6 +1932,7 @@ bool flutterpi_parse_cmdline_args(int argc, char **argv, struct flutterpi_cmdlin
     int runtime_mode_int = FLUTTER_RUNTIME_MODE_DEBUG;
     int vulkan_int = false;
     int dummy_display_int = 0;
+    int wait_for_display_int = 0;
     int longopt_index = 0;
     int opt, ok;
 
@@ -1946,6 +1952,7 @@ bool flutterpi_parse_cmdline_args(int argc, char **argv, struct flutterpi_cmdlin
         { "dummy-display", no_argument, &dummy_display_int, 1 },
         { "dummy-display-size", required_argument, NULL, 's' },
         { "drm-fd", required_argument, NULL, 'f' },
+        { "wait-for-display", no_argument, &wait_for_display_int, 1 },
         { 0, 0, 0, 0 },
     };
     memset(result_out, 0, sizeof *result_out);
@@ -2107,6 +2114,7 @@ valid_format:
     result_out->use_vulkan = vulkan_int;
 
     result_out->dummy_display = !!dummy_display_int;
+    result_out->wait_for_display = !!wait_for_display_int;
 
     return true;
 }
@@ -2181,25 +2189,28 @@ static void on_drmdev_close(int fd, void *fd_metadata, void *userdata) {
 
 static const struct drmdev_interface drmdev_interface = { .open = on_drmdev_open, .close = on_drmdev_close };
 
-static struct drmdev *find_drmdev(struct libseat *libseat) {
+static struct drmdev *find_drmdev(struct libseat *libseat, bool verbose, enum drm_scan_result *result_out) {
     struct drm_connector *connector;
     struct drmdev *drmdev;
     drmDevicePtr devices[64];
-    int ok, n_devices;
+    int ok, n_devices, n_opened;
 
 #ifndef HAVE_LIBSEAT
     ASSERT_EQUALS(libseat, NULL);
 #endif
+    ASSERT_NOT_NULL(result_out);
 
     ok = drmGetDevices2(0, devices, sizeof(devices) / sizeof(*devices));
     if (ok < 0) {
         LOG_ERROR("Could not query DRM device list: %s\n", strerror(-ok));
+        *result_out = kNoDevice_DrmScanResult;
         return NULL;
     }
 
     n_devices = ok;
+    n_opened = 0;
 
-    // find a GPU that has a primary node
+    // find a GPU that has a primary node and a connected display
     drmdev = NULL;
     for (int i = 0; i < n_devices; i++) {
         drmDevicePtr device;
@@ -2213,17 +2224,25 @@ static struct drmdev *find_drmdev(struct libseat *libseat) {
 
         drmdev = drmdev_new_from_path(device->nodes[DRM_NODE_PRIMARY], &drmdev_interface, libseat);
         if (drmdev == NULL) {
-            LOG_ERROR("Could not create drmdev from device at \"%s\". Continuing.\n", device->nodes[DRM_NODE_PRIMARY]);
+            if (verbose) {
+                LOG_ERROR("Could not create drmdev from device at \"%s\". Continuing.\n", device->nodes[DRM_NODE_PRIMARY]);
+            }
             continue;
         }
+
+        n_opened++;
 
         for_each_connector_in_drmdev(drmdev, connector) {
             if (connector->variable_state.connection_state == kConnected_DrmConnectionState) {
                 goto found_connected_connector;
             }
         }
-        LOG_ERROR("Device \"%s\" doesn't have a display connected. Skipping.\n", device->nodes[DRM_NODE_PRIMARY]);
+        if (verbose) {
+            LOG_ERROR("Device \"%s\" doesn't have a display connected. Skipping.\n", device->nodes[DRM_NODE_PRIMARY]);
+        }
         drmdev_unref(drmdev);
+        // Don't return the device we just released if it was the last one.
+        drmdev = NULL;
         continue;
 
 found_connected_connector:
@@ -2232,20 +2251,72 @@ found_connected_connector:
 
     drmFreeDevices(devices, n_devices);
 
-    if (drmdev == NULL) {
-        LOG_ERROR(
-            "flutter-pi couldn't find a usable DRM device.\n"
-            "Please make sure you've enabled the Fake-KMS driver in raspi-config.\n"
-            "If you're not using a Raspberry Pi, please make sure there's KMS support for your graphics chip.\n"
-        );
-        goto fail_free_devices;
+    *result_out = drm_scan_classify(n_opened, drmdev != NULL ? 1 : 0);
+
+    if (drmdev == NULL && verbose) {
+        if (*result_out == kNoDisplay_DrmScanResult) {
+            LOG_ERROR("flutter-pi found a GPU, but no display is connected to it.\n");
+        } else {
+            LOG_ERROR(
+                "flutter-pi couldn't find a usable DRM device.\n"
+                "Please make sure you've enabled the Fake-KMS driver in raspi-config.\n"
+                "If you're not using a Raspberry Pi, please make sure there's KMS support for your graphics chip.\n"
+            );
+        }
     }
 
     return drmdev;
+}
 
-fail_free_devices:
-    drmFreeDevices(devices, n_devices);
-    return NULL;
+/**
+ * @brief Waits until a display is connected, then returns its DRM device.
+ *
+ * Returns NULL if the wait fails or if no DRM device can be opened anymore.
+ */
+static struct drmdev *wait_for_drmdev(struct libseat *libseat) {
+    enum drm_scan_result scan_result;
+    struct display_wait *wait;
+    struct drmdev *drmdev;
+    int ok;
+
+    // Listen before the next scan, so that a display connected between the
+    // first scan and this point is not missed.
+    wait = display_wait_new();
+    if (wait == NULL) {
+        LOG_ERROR("Couldn't wait for a display: out of memory.\n");
+        return NULL;
+    }
+
+    if (display_wait_has_hotplug_events(wait)) {
+        LOG_ERROR("Waiting for a display to be connected (--wait-for-display).\n");
+    } else {
+        LOG_ERROR(
+            "Waiting for a display to be connected (--wait-for-display). Checking every %d s.\n",
+            DISPLAY_WAIT_RESCAN_INTERVAL_MS / 1000
+        );
+    }
+
+    for (;;) {
+        drmdev = find_drmdev(libseat, false, &scan_result);
+        if (drmdev != NULL) {
+            LOG_ERROR("A display was connected. Continuing startup.\n");
+            break;
+        }
+
+        if (scan_result == kNoDevice_DrmScanResult) {
+            LOG_ERROR("The DRM device can't be opened anymore. Stopping the wait for a display.\n");
+            break;
+        }
+
+        ok = display_wait_for_hotplug(wait, DISPLAY_WAIT_RESCAN_INTERVAL_MS);
+        if (ok < 0) {
+            LOG_ERROR("Couldn't wait for a display: %s\n", strerror(-ok));
+            break;
+        }
+    }
+
+    display_wait_destroy(wait);
+    return drmdev;
 }
 
 static struct gbm_device *open_rendernode_as_gbm_device() {
@@ -2535,7 +2606,12 @@ struct flutterpi *flutterpi_new_from_args(int argc, char **argv) {
             drmdev = drmdev_new_from_interface_fd(cmd_args.drm_fd, NULL, &drmdev_interface, libseat);
         }
         else{
-            drmdev = find_drmdev(libseat);
+            enum drm_scan_result scan_result;
+
+            drmdev = find_drmdev(libseat, true, &scan_result);
+            if (drmdev == NULL && scan_result == kNoDisplay_DrmScanResult && cmd_args.wait_for_display) {
+                drmdev = wait_for_drmdev(libseat);
+            }
         }
         if (drmdev == NULL) {
             goto fail_destroy_locales;

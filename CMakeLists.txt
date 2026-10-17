@@ -124,6 +124,7 @@ add_executable(
 add_library(
   flutterpi_module OBJECT
   src/flutter-pi.c
+  src/display_wait.c
   src/platformchannel.c
   src/pluginregistry.c
   src/texture_registry.c
