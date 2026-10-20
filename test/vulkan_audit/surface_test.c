@@ -30,9 +30,10 @@ static uint64_t bo_modifier;
 // which keeps the older tests' single-modifier device.
 static uint64_t vk_modifiers[8];
 static int n_vk_modifiers;
-// Last list passed to gbm_bo_create_with_modifiers and what was given to Vulkan/KMS.
+// Last list and flags passed to gbm_bo_create_with_modifiers2 and what was given to Vulkan/KMS.
 static uint64_t gbm_requested_modifiers[8];
 static int n_gbm_requested_modifiers, gbm_modifier_calls;
+static uint32_t gbm_modifier_flags;
 static bool gbm_ignores_modifier_list;
 static uint64_t image_modifier, addfb_modifier;
 static VkDeviceSize layout_size, required_size, allocation_size, explicit_size;
@@ -193,14 +194,16 @@ void gbm_bo_destroy(struct gbm_bo *bo) {
         bos[i].destroy(bo, bos[i].data);
     bo_destroyed++;
 }
-struct gbm_bo *gbm_bo_create_with_modifiers(
+struct gbm_bo *gbm_bo_create_with_modifiers2(
     struct gbm_device *d,
     uint32_t w,
     uint32_t h,
     uint32_t fmt,
     const uint64_t *modifiers,
-    const unsigned int count
+    const unsigned int count,
+    uint32_t flags
 ) {
+    gbm_modifier_flags = flags;
     (void) d;
     (void) w;
     (void) h;
@@ -508,6 +511,7 @@ void setUp(void) {
     memset(vk_modifiers, 0, sizeof(vk_modifiers));
     memset(gbm_requested_modifiers, 0, sizeof(gbm_requested_modifiers));
     n_vk_modifiers = n_gbm_requested_modifiers = gbm_modifier_calls = 0;
+    gbm_modifier_flags = 0;
     gbm_ignores_modifier_list = false;
     image_modifier = addfb_modifier = DRM_FORMAT_MOD_INVALID;
     last_import_fd = last_fence = -1;
@@ -1116,6 +1120,8 @@ static void common_linear_only_allocates_linear(void) {
     TEST_ASSERT_EQUAL_INT(VK_GBM_BUFFER_COUNT, gbm_modifier_calls);
     TEST_ASSERT_EQUAL_INT(1, n_gbm_requested_modifiers);
     TEST_ASSERT_EQUAL_HEX64(DRM_FORMAT_MOD_LINEAR, gbm_requested_modifiers[0]);
+    // The display reads these buffers, so the allocation must ask for scanout.
+    TEST_ASSERT_EQUAL_HEX32(GBM_BO_USE_RENDERING | GBM_BO_USE_SCANOUT, gbm_modifier_flags);
     present_first_frame_with_modifier(DRM_FORMAT_MOD_LINEAR);
 }
 static void common_tiled_modifier_is_used(void) {

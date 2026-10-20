@@ -409,11 +409,20 @@ static int fb_init(
     uint32_t gbm_format = get_pixfmt_info(pixel_format)->gbm_format;
     bo = NULL;
     if (modifiers != NULL) {
-        // Same allocation call the GL path uses (gbm_surface_create_with_modifiers),
-        // restricted to modifiers Vulkan can also import.
-        bo = gbm_bo_create_with_modifiers(gbm_device, width, height, gbm_format, modifiers, n_modifiers);
+        // Restricted to modifiers Vulkan can also import. Request scanout use
+        // explicitly: on split render/display devices (Pi 5: v3d + vc4), Mesa
+        // uses it to place the buffer where the display controller can read it.
+        bo = gbm_bo_create_with_modifiers2(
+            gbm_device,
+            width,
+            height,
+            gbm_format,
+            modifiers,
+            n_modifiers,
+            GBM_BO_USE_RENDERING | GBM_BO_USE_SCANOUT
+        );
         if (bo == NULL) {
-            LOG_ERROR("Could not create GBM BO with the plane modifiers. gbm_bo_create_with_modifiers: %s\n", strerror(errno));
+            LOG_ERROR("Could not create GBM BO with the plane modifiers. gbm_bo_create_with_modifiers2: %s\n", strerror(errno));
             LOG_ERROR("Will retry without modifiers and keep the result only if it uses a common modifier.\n");
         }
     }
@@ -748,6 +757,14 @@ fail_deinit_previous_fbs:
     }
     free(common_modifiers);
     common_modifiers = NULL;
+
+    // Logged once per surface so a device log shows which layout was chosen.
+    LOG_ERROR(
+        "Vulkan GBM surface %dx%d uses modifier 0x%016llx.\n",
+        (int) size.x,
+        (int) size.y,
+        (unsigned long long) gbm_bo_get_modifier(surface->fbs[0].bo)
+    );
 
     for (int i = 0; i < ARRAY_SIZE(surface->locked_fbs); i++) {
         surface->locked_fbs[i].surface = NULL;

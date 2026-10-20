@@ -7,7 +7,9 @@ render format and passes them to the GL surface. It now passes the same list to
 `vk_gbm_render_surface_new()`. The Vulkan surface keeps only the plane modifiers
 that pass `check_import_support()` (single memory plane, color-attachment and
 transfer features, dma-buf import, size). It then allocates every buffer with
-`gbm_bo_create_with_modifiers()` and that common list. If GBM ignores the list,
+`gbm_bo_create_with_modifiers2()`, that common list, and
+`GBM_BO_USE_RENDERING | GBM_BO_USE_SCANOUT`. The scanout flag matters on split
+render/display devices such as the Pi 5 (v3d + vc4). If GBM ignores the list,
 or the list allocation fails and the usage-flag fallback returns another
 modifier, the buffer is rejected before Vulkan or KMS sees it.
 
@@ -28,8 +30,13 @@ fail as expected: the window passing NULL to Vulkan, skipping the intersection,
 and dropping the post-allocation modifier check.
 
 These are fake-driver tests. They don't show which modifier the Pi selects. The
-on-device check is that KMS accepts Vulkan frames with no atomic commit or
-ADDFB2 errors in the runner log.
+runner logs `Vulkan GBM surface <w>x<h> uses modifier 0x...` once per surface.
+The on-device check is that line plus no atomic commit or ADDFB2 errors in the
+runner log.
+
+Known limit, shared with the GL path: the window takes the modifier list from
+the first plane on the CRTC that supports the format. That may not be the
+plane that finally shows the layer.
 
 ## Latest status: shared-queue host synchronization implemented
 
