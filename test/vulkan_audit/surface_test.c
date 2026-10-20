@@ -26,6 +26,15 @@ static int bo_calls, bo_created, bo_destroyed, images_created, images_destroyed,
 static int fail_step, fail_bo_number, last_import_fd;
 static int bo_planes, invalid_image_creates;
 static uint64_t bo_modifier;
+// Modifiers the fake Vulkan device can import. Empty means "only bo_modifier",
+// which keeps the older tests' single-modifier device.
+static uint64_t vk_modifiers[8];
+static int n_vk_modifiers;
+// Last list passed to gbm_bo_create_with_modifiers and what was given to Vulkan/KMS.
+static uint64_t gbm_requested_modifiers[8];
+static int n_gbm_requested_modifiers, gbm_modifier_calls;
+static bool gbm_ignores_modifier_list;
+static uint64_t image_modifier, addfb_modifier;
 static VkDeviceSize layout_size, required_size, allocation_size, explicit_size;
 static VkResult idle_result, export_result;
 static bool export_supported, export_complete, semaphore_signaled;
@@ -77,6 +86,20 @@ void vkGetPhysicalDeviceFormatProperties2(VkPhysicalDevice physical, VkFormat fo
     VkDrmFormatModifierPropertiesListEXT *list = props->pNext;
     if (capability_failure == 1) {
         list->drmFormatModifierCount = 0;
+        return;
+    }
+    if (n_vk_modifiers > 0) {
+        if (list->pDrmFormatModifierProperties) {
+            for (int i = 0; i < n_vk_modifiers; i++) {
+                list->pDrmFormatModifierProperties[i] = (VkDrmFormatModifierPropertiesEXT) {
+                    .drmFormatModifier = vk_modifiers[i],
+                    .drmFormatModifierPlaneCount = 1,
+                    .drmFormatModifierTilingFeatures = VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_TRANSFER_SRC_BIT |
+                                                       VK_FORMAT_FEATURE_TRANSFER_DST_BIT,
+                };
+            }
+        }
+        list->drmFormatModifierCount = n_vk_modifiers;
         return;
     }
     if (list->pDrmFormatModifierProperties) {
@@ -170,6 +193,31 @@ void gbm_bo_destroy(struct gbm_bo *bo) {
         bos[i].destroy(bo, bos[i].data);
     bo_destroyed++;
 }
+struct gbm_bo *gbm_bo_create_with_modifiers(
+    struct gbm_device *d,
+    uint32_t w,
+    uint32_t h,
+    uint32_t fmt,
+    const uint64_t *modifiers,
+    const unsigned int count
+) {
+    (void) d;
+    (void) w;
+    (void) h;
+    (void) fmt;
+    gbm_modifier_calls++;
+    n_gbm_requested_modifiers = (int) count;
+    for (unsigned int i = 0; i < count && i < ARRAY_SIZE(gbm_requested_modifiers); i++)
+        gbm_requested_modifiers[i] = modifiers[i];
+    bo_calls++;
+    if (fail_step == FAIL_BO || bo_calls == fail_bo_number) {
+        errno = ENOMEM;
+        return NULL;
+    }
+    // Like a driver: pick one of the offered modifiers (or misbehave on request).
+    bo_modifier = gbm_ignores_modifier_list ? I915_FORMAT_MOD_Y_TILED : modifiers[count - 1];
+    return (void *) &bos[bo_created++];
+}
 uint32_t gbm_bo_get_width(struct gbm_bo *bo) {
     (void) bo;
     return 64;
@@ -226,6 +274,7 @@ VkResult vkCreateImage(VkDevice d, const VkImageCreateInfo *ci, const VkAllocati
     const VkExternalMemoryImageCreateInfo *external = ci->pNext;
     const VkImageDrmFormatModifierExplicitCreateInfoEXT *modifier = external->pNext;
     explicit_size = modifier->pPlaneLayouts[0].size;
+    image_modifier = modifier->drmFormatModifier;
     if (ci->format == VK_FORMAT_UNDEFINED || modifier->drmFormatModifierPlaneCount != (uint32_t) bo_planes ||
         modifier->drmFormatModifier == DRM_FORMAT_MOD_INVALID) {
         invalid_image_creates++;
@@ -380,8 +429,7 @@ uint32_t __wrap_drmdev_add_fb(
     (void) fmt;
     (void) stride;
     (void) offset;
-    (void) has_mod;
-    (void) mod;
+    addfb_modifier = has_mod ? mod : DRM_FORMAT_MOD_INVALID;
     return bo + 1000;
 }
 int __wrap_kms_req_builder_push_fb_layer(
@@ -418,7 +466,7 @@ static void observe_deinit(struct surface *surface) {
     vk_gbm_render_surface_deinit(surface);
 }
 static void make_surface(void) {
-    s = vk_gbm_render_surface_new(tracer, VEC2I(64, 64), (void *) &fake_drm, (void *) &fake_renderer, PIXFMT_ARGB8888);
+    s = vk_gbm_render_surface_new(tracer, VEC2I(64, 64), (void *) &fake_drm, (void *) &fake_renderer, PIXFMT_ARGB8888, NULL, 0);
     TEST_ASSERT_NOT_NULL(s);
     external_owner = true;
     s->surface.deinit = observe_deinit;
@@ -457,6 +505,11 @@ void setUp(void) {
     fail_step = fail_bo_number = invalid_image_creates = 0;
     bo_planes = 1;
     bo_modifier = DRM_FORMAT_MOD_LINEAR;
+    memset(vk_modifiers, 0, sizeof(vk_modifiers));
+    memset(gbm_requested_modifiers, 0, sizeof(gbm_requested_modifiers));
+    n_vk_modifiers = n_gbm_requested_modifiers = gbm_modifier_calls = 0;
+    gbm_ignores_modifier_list = false;
+    image_modifier = addfb_modifier = DRM_FORMAT_MOD_INVALID;
     last_import_fd = last_fence = -1;
     layout_size = required_size = 16384;
     allocation_size = explicit_size = 0;
@@ -507,7 +560,7 @@ void tearDown(void) {
     vk_queue_sync_unregister(HANDLE(VkDevice, 1));
 }
 static int import_image(void) {
-    int r = fb_init(&imported, (void *) &fake_drm, (void *) &fake_renderer, 64, 64, PIXFMT_ARGB8888);
+    int r = fb_init(&imported, (void *) &fake_drm, (void *) &fake_renderer, 64, 64, PIXFMT_ARGB8888, NULL, 0);
     import_live = (r == 0);
     return r;
 }
@@ -595,7 +648,7 @@ static void import_early_failures_release_resources(void) {
 }
 static void partial_surface_initialization_unwinds_previous_images(void) {
     fail_bo_number = 3;
-    s = vk_gbm_render_surface_new(tracer, VEC2I(64, 64), (void *) &fake_drm, (void *) &fake_renderer, PIXFMT_ARGB8888);
+    s = vk_gbm_render_surface_new(tracer, VEC2I(64, 64), (void *) &fake_drm, (void *) &fake_renderer, PIXFMT_ARGB8888, NULL, 0);
     TEST_ASSERT_NULL(s);
     TEST_ASSERT_EQUAL_INT(2, bo_created);
     TEST_ASSERT_EQUAL_INT(bo_created, bo_destroyed);
@@ -738,7 +791,7 @@ static void multiplane_modifier_is_supported_or_rejected_before_vulkan(void) {
     }
 }
 static void unsupported_pixel_format_is_rejected_without_abort_or_invalid_vulkan_call(void) {
-    int r = fb_init(&imported, (void *) &fake_drm, (void *) &fake_renderer, 64, 64, PIXFMT_RGB565);
+    int r = fb_init(&imported, (void *) &fake_drm, (void *) &fake_renderer, 64, 64, PIXFMT_RGB565, NULL, 0);
     import_live = (r == 0);
     TEST_ASSERT_NOT_EQUAL(0, r);
     TEST_ASSERT_EQUAL_INT(ENOTSUP, r);
@@ -1027,6 +1080,66 @@ static void failed_final_wait_retains_gpu_resources(void) {
     TEST_ASSERT_EQUAL_INT(0, busy_destroys);
     TEST_ASSERT_EQUAL_INT(2, refs);
 }
+// Open item #7: allocate only with modifiers both the display plane and Vulkan accept.
+static struct vk_gbm_render_surface *make_plane_surface(const uint64_t *plane, size_t n_plane) {
+    return vk_gbm_render_surface_new(tracer, VEC2I(64, 64), (void *) &fake_drm, (void *) &fake_renderer, PIXFMT_ARGB8888, plane, n_plane);
+}
+static void present_first_frame_with_modifier(uint64_t expected) {
+    TEST_ASSERT_NOT_NULL(s);
+    external_owner = true;
+    s->surface.deinit = observe_deinit;
+    fill(0);
+    queue(0);
+    TEST_ASSERT_EQUAL_INT(0, present());
+    TEST_ASSERT_EQUAL_INT(1, pushed);
+    TEST_ASSERT_EQUAL_HEX64(expected, image_modifier);
+    TEST_ASSERT_EQUAL_HEX64(expected, addfb_modifier);
+}
+static void no_common_plane_modifier_fails_cleanly(void) {
+    const uint64_t plane[] = { DRM_FORMAT_MOD_BROADCOM_UIF, DRM_FORMAT_MOD_BROADCOM_SAND128 };
+    vk_modifiers[0] = DRM_FORMAT_MOD_LINEAR;
+    n_vk_modifiers = 1;
+    s = make_plane_surface(plane, ARRAY_SIZE(plane));
+    TEST_ASSERT_NULL(s);
+    // Nothing allocated, nothing to present, and no references leaked.
+    TEST_ASSERT_EQUAL_INT(0, bo_calls);
+    TEST_ASSERT_EQUAL_INT(0, images_created);
+    TEST_ASSERT_EQUAL_INT(0, pushed);
+    TEST_ASSERT_EQUAL_INT(1, renderer_refs);
+}
+static void common_linear_only_allocates_linear(void) {
+    const uint64_t plane[] = { DRM_FORMAT_MOD_LINEAR, DRM_FORMAT_MOD_BROADCOM_SAND128 };
+    vk_modifiers[0] = DRM_FORMAT_MOD_BROADCOM_UIF;
+    vk_modifiers[1] = DRM_FORMAT_MOD_LINEAR;
+    n_vk_modifiers = 2;
+    s = make_plane_surface(plane, ARRAY_SIZE(plane));
+    TEST_ASSERT_EQUAL_INT(VK_GBM_BUFFER_COUNT, gbm_modifier_calls);
+    TEST_ASSERT_EQUAL_INT(1, n_gbm_requested_modifiers);
+    TEST_ASSERT_EQUAL_HEX64(DRM_FORMAT_MOD_LINEAR, gbm_requested_modifiers[0]);
+    present_first_frame_with_modifier(DRM_FORMAT_MOD_LINEAR);
+}
+static void common_tiled_modifier_is_used(void) {
+    const uint64_t plane[] = { DRM_FORMAT_MOD_BROADCOM_UIF, DRM_FORMAT_MOD_BROADCOM_SAND128 };
+    vk_modifiers[0] = DRM_FORMAT_MOD_LINEAR;
+    vk_modifiers[1] = DRM_FORMAT_MOD_BROADCOM_UIF;
+    n_vk_modifiers = 2;
+    s = make_plane_surface(plane, ARRAY_SIZE(plane));
+    TEST_ASSERT_EQUAL_INT(1, n_gbm_requested_modifiers);
+    TEST_ASSERT_EQUAL_HEX64(DRM_FORMAT_MOD_BROADCOM_UIF, gbm_requested_modifiers[0]);
+    present_first_frame_with_modifier(DRM_FORMAT_MOD_BROADCOM_UIF);
+}
+static void allocator_ignoring_common_modifiers_is_rejected(void) {
+    const uint64_t plane[] = { DRM_FORMAT_MOD_LINEAR };
+    vk_modifiers[0] = DRM_FORMAT_MOD_LINEAR;
+    vk_modifiers[1] = I915_FORMAT_MOD_Y_TILED;
+    n_vk_modifiers = 2;
+    gbm_ignores_modifier_list = true;
+    s = make_plane_surface(plane, ARRAY_SIZE(plane));
+    TEST_ASSERT_NULL(s);
+    TEST_ASSERT_EQUAL_INT(0, images_created);
+    TEST_ASSERT_EQUAL_INT(bo_created, bo_destroyed);
+    TEST_ASSERT_EQUAL_INT(1, renderer_refs);
+}
 int main(int argc, char **argv) {
     UNITY_BEGIN();
     int selected = 0;
@@ -1035,6 +1148,10 @@ int main(int argc, char **argv) {
         selected++;                              \
         RUN_TEST(f);                             \
     }
+    CASE(no_common_plane_modifier_fails_cleanly)
+    CASE(common_linear_only_allocates_linear)
+    CASE(common_tiled_modifier_is_used)
+    CASE(allocator_ignoring_common_modifiers_is_rejected)
     CASE(failed_fence_dup_preserves_completion_for_retry)
     CASE(interrupted_fence_wait_retries_without_queue_access)
     CASE(errored_sync_file_does_not_present)

@@ -96,7 +96,8 @@ add_test(NAME vulkan_audit.modifier_allocation_failure_does_not_dereference_null
 set_tests_properties(vulkan_audit.modifier_allocation_failure_does_not_dereference_null
     PROPERTIES LABELS "vulkan-audit;vulkan-audit-followup" TIMEOUT 10)
 
-foreach(case gl_modifier_allocation_failure_preserves_cache empty_modifier_list_does_not_require_allocation)
+foreach(case gl_modifier_allocation_failure_preserves_cache empty_modifier_list_does_not_require_allocation
+        vulkan_surface_receives_plane_modifiers vulkan_surface_without_plane_modifiers_gets_null)
     add_test(NAME vulkan_audit.${case} COMMAND vulkan_window_audit_test ${case})
     set_tests_properties(vulkan_audit.${case} PROPERTIES LABELS vulkan-audit TIMEOUT 10)
 endforeach()
@@ -155,3 +156,10 @@ if(HAVE_VULKAN)
         set_tests_properties(vulkan_queue_sync.${case} PROPERTIES LABELS "vulkan-audit;vulkan-queue-sync" TIMEOUT 10)
     endforeach()
 endif()
+
+# Open item #7: Vulkan allocates only with modifiers the display plane also accepts.
+foreach(case no_common_plane_modifier_fails_cleanly common_linear_only_allocates_linear
+        common_tiled_modifier_is_used allocator_ignoring_common_modifiers_is_rejected)
+    add_test(NAME vulkan_audit.${case} COMMAND vulkan_surface_audit_test ${case})
+    set_tests_properties(vulkan_audit.${case} PROPERTIES LABELS "vulkan-audit;vulkan-audit-modifiers" TIMEOUT 10)
+endforeach()

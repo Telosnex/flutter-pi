@@ -116,7 +116,7 @@ int main(int argc, char **argv) {
     if (!renderer)
         goto out;
     for (int cycle = 0; cycle < 20; cycle++) {
-        struct vk_gbm_render_surface *s = vk_gbm_render_surface_new(tracer, VEC2I(64, 64), gbm, renderer, PIXFMT_ARGB8888);
+        struct vk_gbm_render_surface *s = vk_gbm_render_surface_new(tracer, VEC2I(64, 64), gbm, renderer, PIXFMT_ARGB8888, NULL, 0);
         if (!s)
             goto out;
         FlutterBackingStore store = { 0 };

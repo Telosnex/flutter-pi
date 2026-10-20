@@ -31,18 +31,38 @@ struct gbm_device *__wrap_drmdev_get_gbm_device(struct drmdev *d) {
     (void) d;
     return NULL;
 }
-struct vk_gbm_render_surface *
-__wrap_vk_gbm_render_surface_new(struct tracer *t, struct vec2i size, struct gbm_device *d, struct vk_renderer *r, enum pixfmt fmt) {
+static uint64_t vk_received_modifiers[4];
+static size_t n_vk_received_modifiers;
+static bool vk_received_null_modifiers;
+struct vk_gbm_render_surface *__wrap_vk_gbm_render_surface_new(
+    struct tracer *t,
+    struct vec2i size,
+    struct gbm_device *d,
+    struct vk_renderer *r,
+    enum pixfmt fmt,
+    const uint64_t *modifiers,
+    size_t n_modifiers
+) {
     (void) d;
     (void) r;
     (void) fmt;
+    vk_received_null_modifiers = modifiers == NULL;
+    n_vk_received_modifiers = n_modifiers;
+    for (size_t i = 0; modifiers && i < n_modifiers && i < 4; i++)
+        vk_received_modifiers[i] = modifiers[i];
     return fail_allocate ? NULL : (void *) dummy_render_surface_new(t, size);
 }
 void __wrap_drm_plane_for_each_modified_format(struct drm_plane *p, drm_plane_modified_format_callback_t cb, void *data) {
-    if (!empty_modifiers) cb(p, 0, PIXFMT_ARGB8888, DRM_FORMAT_MOD_LINEAR, data);
+    if (!empty_modifiers) {
+        cb(p, 0, PIXFMT_ARGB8888, DRM_FORMAT_MOD_LINEAR, data);
+        cb(p, 0, PIXFMT_ARGB8888, DRM_FORMAT_MOD_BROADCOM_UIF, data);
+    }
 }
 void setUp(void) {
     fail_allocate = fail_modifier_allocation = advertise_modifiers = empty_modifiers = false;
+    memset(vk_received_modifiers, 0, sizeof(vk_received_modifiers));
+    n_vk_received_modifiers = 0;
+    vk_received_null_modifiers = false;
     fake_plane = (struct drm_plane) { .possible_crtcs = 1, .type = kPrimary_DrmPlaneType, .supports_modifiers = true };
     fake_crtc = (struct drm_crtc) { .bitmask = 1 };
     tracer = tracer_new_with_stubs();
@@ -88,6 +108,21 @@ static void empty_modifier_list_does_not_require_allocation(void) {
     TEST_ASSERT_EQUAL_INT(128, s->size.x);
     TEST_ASSERT_EQUAL_INT(96, s->size.y);
 }
+static void vulkan_surface_receives_plane_modifiers(void) {
+    w.kms.crtc = &fake_crtc;
+    advertise_modifiers = true;
+    TEST_ASSERT_NOT_NULL(kms_window_get_render_surface_internal(&w, true, VEC2I(128, 96)));
+    TEST_ASSERT_FALSE(vk_received_null_modifiers);
+    TEST_ASSERT_EQUAL_size_t(2, n_vk_received_modifiers);
+    TEST_ASSERT_EQUAL_HEX64(DRM_FORMAT_MOD_LINEAR, vk_received_modifiers[0]);
+    TEST_ASSERT_EQUAL_HEX64(DRM_FORMAT_MOD_BROADCOM_UIF, vk_received_modifiers[1]);
+}
+static void vulkan_surface_without_plane_modifiers_gets_null(void) {
+    w.kms.crtc = &fake_crtc;
+    TEST_ASSERT_NOT_NULL(kms_window_get_render_surface_internal(&w, true, VEC2I(128, 96)));
+    TEST_ASSERT_TRUE(vk_received_null_modifiers);
+    TEST_ASSERT_EQUAL_size_t(0, n_vk_received_modifiers);
+}
 int main(int argc, char **argv) {
     UNITY_BEGIN();
     int selected = 0;
@@ -96,6 +131,8 @@ int main(int argc, char **argv) {
         selected++;                              \
         RUN_TEST(f);                             \
     }
+    CASE(vulkan_surface_receives_plane_modifiers)
+    CASE(vulkan_surface_without_plane_modifiers_gets_null)
     CASE(gl_modifier_allocation_failure_preserves_cache)
     CASE(empty_modifier_list_does_not_require_allocation)
     CASE(modifier_allocation_failure_does_not_dereference_null)

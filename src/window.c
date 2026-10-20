@@ -1491,7 +1491,7 @@ static struct render_surface *kms_window_get_render_surface_internal(struct wind
 
     // Possibly populate this with the supported modifiers for this pixel format.
     // If no plane lists modifiers for this pixel format, this will be left at NULL,
-    // and egl_gbm_render_surface_new... will create the GBM surface using usage flags
+    // and the EGL and Vulkan surfaces will allocate using usage flags
     // (GBM_USE_SCANOUT | GBM_USE_RENDER) instead.
     uint64_t *allowed_modifiers = NULL;
     size_t n_allowed_modifiers = 0;
@@ -1587,8 +1587,17 @@ static struct render_surface *kms_window_get_render_surface_internal(struct wind
 
         // vulkan
 #ifdef HAVE_VULKAN
-        struct vk_gbm_render_surface *vk_surface =
-            vk_gbm_render_surface_new(window->tracer, size, drmdev_get_gbm_device(window->kms.drmdev), window->vk_renderer, pixel_format);
+        // Same plane modifier list as the GL path. The surface intersects it with
+        // what Vulkan can import, so KMS accepts every buffer it allocates.
+        struct vk_gbm_render_surface *vk_surface = vk_gbm_render_surface_new(
+            window->tracer,
+            size,
+            drmdev_get_gbm_device(window->kms.drmdev),
+            window->vk_renderer,
+            pixel_format,
+            allowed_modifiers,
+            n_allowed_modifiers
+        );
         if (vk_surface == NULL) {
             LOG_ERROR("Couldn't create Vulkan GBM rendering surface.\n");
             render_surface = NULL;

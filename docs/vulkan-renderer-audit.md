@@ -1,5 +1,36 @@
 # Vulkan renderer audit — 2026-10-06
 
+## Latest status: display-plane modifier intersection (#7) fixed
+
+The window already picks the modifiers the display plane accepts for the
+render format and passes them to the GL surface. It now passes the same list to
+`vk_gbm_render_surface_new()`. The Vulkan surface keeps only the plane modifiers
+that pass `check_import_support()` (single memory plane, color-attachment and
+transfer features, dma-buf import, size). It then allocates every buffer with
+`gbm_bo_create_with_modifiers()` and that common list. If GBM ignores the list,
+or the list allocation fails and the usage-flag fallback returns another
+modifier, the buffer is rejected before Vulkan or KMS sees it.
+
+If the plane and Vulkan have no modifier in common, surface creation logs
+`No DRM format modifier for <format> is accepted by both the display plane ...`
+and returns NULL. Nothing is allocated, and no frame reaches KMS. If the plane
+lists no modifiers (no `IN_FORMATS`), the surface keeps the old usage-flag
+allocation, as the GL path does.
+
+New regressions (label `vulkan-audit-modifiers`, plus two window tests):
+`no_common_plane_modifier_fails_cleanly`, `common_linear_only_allocates_linear`,
+`common_tiled_modifier_is_used`, `allocator_ignoring_common_modifiers_is_rejected`,
+`vulkan_surface_receives_plane_modifiers` and
+`vulkan_surface_without_plane_modifiers_gets_null`. The tiled and LINEAR cases
+check the modifier given to GBM, to `vkCreateImage` and to ADDFB2. Results:
+**91/91 Release (CI `telosnex/build.sh`), 92/92 Debug+ASan/UBSan.** Three mutations
+fail as expected: the window passing NULL to Vulkan, skipping the intersection,
+and dropping the post-allocation modifier check.
+
+These are fake-driver tests. They don't show which modifier the Pi selects. The
+on-device check is that KMS accepts Vulkan frames with no atomic commit or
+ADDFB2 errors in the runner log.
+
 ## Latest status: shared-queue host synchronization implemented
 
 The patched SDK and installed engine were identified and matched to their runtime
@@ -12,7 +43,7 @@ for implementation, provenance, concurrency tests and remaining integration limi
 concurrency tests. Two lock/resolver mutation checks fail as expected. A real Pi
 GPU smoke passed 20 cycles through the nested resolver. No service deployment or
 restart; real Flutter/WPE threading-validation/soak is still pending. Display-plane
-modifier intersection remains open. Historical statements below that queue
+modifier intersection was open at this checkpoint; it is fixed above. Historical statements below that queue
 synchronization is unimplemented are superseded by this section.
 
 
@@ -64,7 +95,7 @@ per-image completion API. **Shared-queue host synchronization (#1) remains open*
 these changes do not provide an engine-shared queue lock, and surface teardown
 and first scanout/fallback still access the engine's queue/device. A surface-local
 lock cannot resolve that. The display-plane/Vulkan modifier intersection (#7)
-also remains separate: validating Vulkan importability is not proof that the
+also remained separate at this checkpoint (now fixed, see the latest status): validating Vulkan importability is not proof that the
 selected display plane can scan the image. Do not deploy on the strength of unit
 results alone; the customized engine contract and real Flutter/KMS integration
 still require validation.
@@ -109,7 +140,7 @@ on-device frame trace was performed.
 | 4 | **Two modeled reds:** without export support, or after failed export and successful fallback retired the semaphore, a later discarded engine submission's image is destroyed without a final wait. The mock tracks one specific busy image. The semaphore-enabled teardown control waits and passes. These models assume the engine can release an unpresented backing store before GPU completion; that release/completion contract must be checked against the customized engine. They do not demonstrate a real GPU use-after-free. |
 | 5 | **Red for the invalid-modifier case:** DRM_FORMAT_MOD_INVALID is passed into explicit Vulkan modifier image creation before being rejected by the mock. The broader format/modifier/usage capability intersection remains source-level review; no real-driver unsupported-combination sweep was done. |
 | 6 | Already fixed before this pass: multi-plane GBM buffers are rejected with ENOTSUP before Vulkan image creation. Its existing test still passes. |
-| 7 | Source-level concern remains: window modifier selection is supplied to GL but not the Vulkan constructor/GBM allocation. No new end-to-end display-compatibility test in this pass. A later KMS rejection is not necessarily invalid Vulkan usage. |
+| 7 | **Fixed** (see the latest status). The window's plane modifier list now reaches the Vulkan constructor. Buffers are allocated only with modifiers that both the plane and Vulkan accept. No common modifier fails surface creation with a clear log line. Originally: window modifier selection was supplied to GL but not the Vulkan constructor/GBM allocation. A later KMS rejection is not necessarily invalid Vulkan usage. |
 | 8 | Confirmed stale comment: the path uses the transparent pixel format, not the claimed XRGB cast. This is not proof that using transparency is wrong for the current display/composition. No test encodes an unverified Pi 4 workaround as required behavior. |
 | 9 | **Red:** the raw Vulkan surface's fbdev present callback traps at UNIMPLEMENTED instead of returning an error. This is a direct API test, not proof that startup selects this combination or that the complete fbdev route reaches it. |
 | 10 | **Red:** directly presenting a non-axis-aligned Vulkan layer aborts in Debug/ASan and returns success in Release, handing the bounding rectangle to KMS. The test requests graceful rejection, not implementation of arbitrary transforms. It does not prove that a particular engine layer or rotation configuration reaches this path. |

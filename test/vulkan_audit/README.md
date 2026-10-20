@@ -69,7 +69,7 @@ hardware-dependent questions left open.
 
 ## Current status
 
-All regressions pass: **85 Release / 86 Debug / 86 ASan+UBSan**. The seven
+All regressions pass: **91 Release / 92 Debug / 92 ASan+UBSan**. The seven
 source-review cases formerly labeled `vulkan-audit-open` are now selected with
 `vulkan-audit-source-review` and remain ordinary tests, not WILL_FAIL cases.
 
@@ -85,8 +85,10 @@ without sleeps. Existing surface tests also route through this layer. A native
 render-node smoke uses nested engine-style proc lookup, but a real Flutter/WPE
 concurrency soak and Vulkan threading validation have not been run.
 
-The pool remains bounded (six slots); real KMS modifier compatibility is not
-established by these tests. See `docs/vulkan-shared-queue-review.md` and the newest
+The pool remains bounded (six slots). The `vulkan-audit-modifiers` cases check
+that Vulkan allocates only with modifiers the display plane also lists, and that
+no common modifier fails surface creation cleanly. They use a fake driver, so
+real KMS acceptance on the Pi still has to be checked on the device. See `docs/vulkan-shared-queue-review.md` and the newest
 audit report section for provenance, mutation checks and integration limits.
 
 The opt-in `vulkan_gbm_smoke` binary is not registered in CTest. It opens only a

@@ -313,8 +313,81 @@ static int check_import_support(struct vk_renderer *renderer, VkFormat format, u
     return 0;
 }
 
-static int
-fb_init(struct fb *fb, struct gbm_device *gbm_device, struct vk_renderer *renderer, int width, int height, enum pixfmt pixel_format) {
+static bool modifier_in_list(uint64_t modifier, const uint64_t *modifiers, size_t n_modifiers) {
+    for (size_t i = 0; i < n_modifiers; i++) {
+        if (modifiers[i] == modifier)
+            return true;
+    }
+    return false;
+}
+
+/**
+ * @brief Keep the plane modifiers that this Vulkan device can import and render to.
+ *
+ * @param plane_modifiers The modifiers the target KMS plane accepts for this format.
+ * @param out Receives the common modifiers, in plane order, without duplicates.
+ *            Must have room for @p n_plane_modifiers entries.
+ * @param n_out Receives the number of common modifiers. Zero means there is none.
+ * @returns 0, or an errno if a Vulkan query failed (an unsupported modifier is not an error).
+ */
+static int select_common_modifiers(
+    struct vk_renderer *renderer,
+    VkFormat vk_format,
+    int width,
+    int height,
+    const uint64_t *plane_modifiers,
+    size_t n_plane_modifiers,
+    uint64_t *out,
+    size_t *n_out
+) {
+    size_t n = 0;
+
+    for (size_t i = 0; i < n_plane_modifiers; i++) {
+        uint64_t modifier = plane_modifiers[i];
+        if (modifier == DRM_FORMAT_MOD_INVALID || modifier_in_list(modifier, out, n))
+            continue;
+
+        int ok = check_import_support(renderer, vk_format, modifier, width, height);
+        if (ok == ENOTSUP)
+            continue;
+        if (ok != 0)
+            return ok;
+        out[n++] = modifier;
+    }
+
+    *n_out = n;
+    return 0;
+}
+
+static VkFormat get_render_vk_format(enum pixfmt pixel_format) {
+    VkFormat vk_format = get_pixfmt_info(pixel_format)->vk_format;
+
+    /// FIXME: Right now, using any _SRGB format (for example VK_FORMAT_B8G8R8A8_SRGB) will not work because
+    /// that'll break some assertions inside flutter / skia. (VK_FORMAT_B8G8R8A8_SRGB maps to GrColorType::kRGBA_8888_SRGB,
+    /// but some other part of flutter will use GrColorType::kRGBA_8888 so you'll get a mismatch at some point)
+    /// We're just converting the _SRGB to a _UNORM here, but I'm not really sure that's guaranteed to work.
+    /// (_UNORM can mean anything basically)
+    if (vk_format != VK_FORMAT_UNDEFINED && is_srgb_format(vk_format)) {
+        vk_format = srgb_to_unorm_format(vk_format);
+    }
+    return vk_format;
+}
+
+/**
+ * @param modifiers The modifiers both Vulkan and the target plane accept (see select_common_modifiers),
+ *                  or NULL if the plane does not list modifiers. Then GBM picks a scanout-capable
+ *                  layout from usage flags, as the GL path does.
+ */
+static int fb_init(
+    struct fb *fb,
+    struct gbm_device *gbm_device,
+    struct vk_renderer *renderer,
+    int width,
+    int height,
+    enum pixfmt pixel_format,
+    const uint64_t *modifiers,
+    size_t n_modifiers
+) {
     PFN_vkGetMemoryFdPropertiesKHR get_memory_fd_props;
     VkSubresourceLayout layout;
     VkDeviceMemory img_device_memory;
@@ -325,7 +398,7 @@ fb_init(struct fb *fb, struct gbm_device *gbm_device, struct vk_renderer *render
     VkImage vkimg;
     int fd;
 
-    vk_format = get_pixfmt_info(pixel_format)->vk_format;
+    vk_format = get_render_vk_format(pixel_format);
     if (vk_format == VK_FORMAT_UNDEFINED) {
         LOG_ERROR("Pixel format is not supported by the Vulkan renderer.\n");
         return ENOTSUP;
@@ -333,20 +406,34 @@ fb_init(struct fb *fb, struct gbm_device *gbm_device, struct vk_renderer *render
 
     device = vk_renderer_get_device(renderer);
 
-    /// FIXME: Right now, using any _SRGB format (for example VK_FORMAT_B8G8R8A8_SRGB) will not work because
-    /// that'll break some assertions inside flutter / skia. (VK_FORMAT_B8G8R8A8_SRGB maps to GrColorType::kRGBA_8888_SRGB,
-    /// but some other part of flutter will use GrColorType::kRGBA_8888 so you'll get a mismatch at some point)
-    /// We're just converting the _SRGB to a _UNORM here, but I'm not really sure that's guaranteed to work.
-    /// (_UNORM can mean anything basically)
-
-    if (is_srgb_format(vk_format)) {
-        vk_format = srgb_to_unorm_format(vk_format);
+    uint32_t gbm_format = get_pixfmt_info(pixel_format)->gbm_format;
+    bo = NULL;
+    if (modifiers != NULL) {
+        // Same allocation call the GL path uses (gbm_surface_create_with_modifiers),
+        // restricted to modifiers Vulkan can also import.
+        bo = gbm_bo_create_with_modifiers(gbm_device, width, height, gbm_format, modifiers, n_modifiers);
+        if (bo == NULL) {
+            LOG_ERROR("Could not create GBM BO with the plane modifiers. gbm_bo_create_with_modifiers: %s\n", strerror(errno));
+            LOG_ERROR("Will retry without modifiers and keep the result only if it uses a common modifier.\n");
+        }
     }
-
-    bo = gbm_bo_create(gbm_device, width, height, get_pixfmt_info(pixel_format)->gbm_format, GBM_BO_USE_RENDERING | GBM_BO_USE_SCANOUT);
+    if (bo == NULL) {
+        bo = gbm_bo_create(gbm_device, width, height, gbm_format, GBM_BO_USE_RENDERING | GBM_BO_USE_SCANOUT);
+    }
     if (bo == NULL) {
         LOG_ERROR("Could not create GBM BO. gbm_bo_create: %s\n", strerror(errno));
         return EIO;
+    }
+
+    // GBM may ignore the list (or we fell back to usage flags). KMS would then
+    // reject the buffer at ADDFB2 / atomic commit time, so reject it now.
+    if (modifiers != NULL && !modifier_in_list(gbm_bo_get_modifier(bo), modifiers, n_modifiers)) {
+        LOG_ERROR(
+            "GBM allocated modifier 0x%016llx, which the display plane or Vulkan does not accept.\n",
+            (unsigned long long) gbm_bo_get_modifier(bo)
+        );
+        gbm_bo_destroy(bo);
+        return ENOTSUP;
     }
 
     // The import below describes one memory plane and binds one dma-buf.
@@ -579,17 +666,73 @@ int vk_gbm_render_surface_init(
     struct vec2i size,
     struct gbm_device *gbm_device,
     struct vk_renderer *renderer,
-    enum pixfmt pixel_format
+    enum pixfmt pixel_format,
+    const uint64_t *allowed_modifiers,
+    size_t n_allowed_modifiers
 ) {
+    uint64_t *common_modifiers = NULL;
+    size_t n_common_modifiers = 0;
     int ok;
+
+    // The window passes the modifiers the chosen display plane accepts for this
+    // format (the same list the GL path gets). Allocate only with modifiers that
+    // Vulkan can import too; otherwise KMS rejects the frame at present time.
+    if (allowed_modifiers != NULL && n_allowed_modifiers > 0) {
+        VkFormat vk_format = get_render_vk_format(pixel_format);
+        if (vk_format == VK_FORMAT_UNDEFINED) {
+            LOG_ERROR("Pixel format is not supported by the Vulkan renderer.\n");
+            return ENOTSUP;
+        }
+
+        common_modifiers = calloc(n_allowed_modifiers, sizeof *common_modifiers);
+        if (common_modifiers == NULL) {
+            return ENOMEM;
+        }
+
+        ok = select_common_modifiers(
+            renderer,
+            vk_format,
+            (int) size.x,
+            (int) size.y,
+            allowed_modifiers,
+            n_allowed_modifiers,
+            common_modifiers,
+            &n_common_modifiers
+        );
+        if (ok != 0) {
+            free(common_modifiers);
+            return ok;
+        }
+
+        if (n_common_modifiers == 0) {
+            LOG_ERROR(
+                "No DRM format modifier for %s is accepted by both the display plane (%zu offered) and the Vulkan device. "
+                "Can't create a Vulkan render surface that KMS can scan out.\n",
+                get_pixfmt_info(pixel_format)->name,
+                n_allowed_modifiers
+            );
+            free(common_modifiers);
+            return ENOTSUP;
+        }
+    }
 
     ok = render_surface_init(CAST_RENDER_SURFACE_UNCHECKED(surface), tracer, size);
     if (ok != 0) {
+        free(common_modifiers);
         return EIO;
     }
 
     for (int i = 0; i < ARRAY_SIZE(surface->fbs); i++) {
-        ok = fb_init(surface->fbs + i, gbm_device, renderer, (int) size.x, (int) size.y, pixel_format);
+        ok = fb_init(
+            surface->fbs + i,
+            gbm_device,
+            renderer,
+            (int) size.x,
+            (int) size.y,
+            pixel_format,
+            common_modifiers,
+            n_common_modifiers
+        );
         if (ok != 0) {
             LOG_ERROR("Could not initialize vulkan GBM framebuffer.\n");
             goto fail_deinit_previous_fbs;
@@ -603,6 +746,8 @@ fail_deinit_previous_fbs:
         }
         goto fail_deinit_render_surface;
     }
+    free(common_modifiers);
+    common_modifiers = NULL;
 
     for (int i = 0; i < ARRAY_SIZE(surface->locked_fbs); i++) {
         surface->locked_fbs[i].surface = NULL;
@@ -678,6 +823,7 @@ fail_deinit_previous_fbs:
     return 0;
 
 fail_deinit_render_surface:
+    free(common_modifiers);
     render_surface_deinit(CAST_SURFACE_UNCHECKED(surface));
     return EIO;
 }
@@ -687,7 +833,9 @@ struct vk_gbm_render_surface *vk_gbm_render_surface_new(
     struct vec2i size,
     struct gbm_device *device,
     struct vk_renderer *renderer,
-    enum pixfmt pixel_format
+    enum pixfmt pixel_format,
+    const uint64_t *allowed_modifiers,
+    size_t n_allowed_modifiers
 ) {
     struct vk_gbm_render_surface *surface;
     int ok;
@@ -697,7 +845,7 @@ struct vk_gbm_render_surface *vk_gbm_render_surface_new(
         goto fail_return_null;
     }
 
-    ok = vk_gbm_render_surface_init(surface, tracer, size, device, renderer, pixel_format);
+    ok = vk_gbm_render_surface_init(surface, tracer, size, device, renderer, pixel_format, allowed_modifiers, n_allowed_modifiers);
     if (ok != 0) {
         goto fail_free_surface;
     }
