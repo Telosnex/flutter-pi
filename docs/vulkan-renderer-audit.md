@@ -16,7 +16,7 @@ webview opened at 19:26:20 and closed at 19:41:07.
 | `VK_ERROR_*`, device lost, fence timeouts | 0 |
 | Other validation messages | 20 at startup only, then none: `SYNC-HAZARD-WRITE-AFTER-WRITE` (render-pass depth clear, mipmap `vkCmdBlitImage`) and `SYNC-HAZARD-READ-AFTER-WRITE` (`vkCmdCopyImageToBuffer` readback), each after a layout-transition barrier with the wrong stage. flutter-pi records none of these commands, so they come from the engine. |
 | Surface-pool EAGAIN | **14**, all 19:26:20–19:26:40, when the visible webview opened |
-| WPE frames on the GPU path | **None.** On close: `destroyed after 0 frames, 0 dropped, 0 source imports`. The screen showed nothing in the webview. |
+| WPE frames | **Unknown count; nothing visible.** `webview_direct.c` scanned out at least one WebKit buffer on a plane (`Plane path live: presenting 1920x1125 at (0,0)`). The GPU copy path stayed unused (`destroyed after 0 frames, ... 0 source imports`; that counter covers only copied frames). Per-frame counts need `FLUTTERPI_WEBVIEW_STATS`, which was not set. The webview area showed nothing on screen. |
 
 Pool dump at the first EAGAIN (1920x1200, 6 slots): every slot has
 `flutter=0`. Only slot 4 is `front=1` (refs=3). Slot 2 has refs=2, and slots 0,
@@ -25,10 +25,13 @@ but are still referenced: pending present, a KMS callback that has not released
 them, or a missing unref. The burst stopped by itself after 20 s.
 
 Conclusion: the shared-queue lock showed no threading error under validation,
-but the soak does not meet its goal. WPE never submitted to the shared queue,
-so the Flutter+WPE concurrency case was not exercised. Open:
+but the soak does not meet its goal. WebKit renders with its own GL context, so
+it reaches the Vulkan queue only through repaints it triggers
+(`compositor_request_repaint` → `surface_present_kms` on the WebKit thread).
+With no visible, continuously updating webview, that concurrency was barely
+exercised. Open:
 
-1. Why the visible WPE webview produced no GPU frames (0 source imports).
+1. Why the visible WPE webview showed nothing although its plane was presented.
 2. What holds five non-front slots when a layer appears.
 3. The engine sync hazards above, for the patched-engine layout item.
 
