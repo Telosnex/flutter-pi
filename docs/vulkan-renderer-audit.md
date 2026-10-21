@@ -35,7 +35,16 @@ exercised. Open:
 2. What holds five non-front slots when a layer appears.
 3. The engine sync hazards above, for the patched-engine layout item.
 
-Rerun the soak after 1 and 2. Full log: `/tmp/soak-20261020.log` on the
+Rerun the soak after 1 and 2.
+
+Follow-up (2026-10-21, runner `telosnex/2026-10-21-0aa85f3`): the webview
+rendered on plane p107 between Flutter's lower and upper layers. A KMS trace
+showed each pool exhaustion matched a brief third Flutter layer (2 layers x 3
+buffers = all 6 slots), so item 2 was pool sizing, not a leak. The pool is now
+9 slots. The same release sets premultiplied blend mode on every plane above
+the bottom one, which fixed a black square behind the cursor. On device, the
+webview flicker and the cursor square are both gone. Item 1 did not reproduce.
+Item 3 and the full soak rerun remain open. Full log: `/tmp/soak-20261020.log` on the
 operator Mac (not durable).
 
 ## Latest status: display-plane modifier intersection (#7) fixed
