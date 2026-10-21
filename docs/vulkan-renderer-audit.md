@@ -1,5 +1,40 @@
 # Vulkan renderer audit — 2026-10-06
 
+## Latest status: first on-device soak (2026-10-20) — partial, not passed
+
+Runner `telosnex/2026-10-20-e3b24ec` on the CM5 (`raspberrypi`), Debian
+`vulkan-validationlayers` 1.4.309 with `VK_LAYER_KHRONOS_validation` and
+`VK_VALIDATION_VALIDATE_SYNC=1` set through a temporary `zz-experiment.conf`
+(removed after the run). One process (PID 4053157) ran 11 h 56 min. About 40
+minutes of it (19:21–20:00) were interactive use, including one visible WPE
+webview opened at 19:26:20 and closed at 19:41:07.
+
+| Check | Result |
+| --- | --- |
+| Runner restarts | 0 |
+| Validation threading errors (shared queue) | 0 |
+| `VK_ERROR_*`, device lost, fence timeouts | 0 |
+| Other validation messages | 20 at startup only, then none: `SYNC-HAZARD-WRITE-AFTER-WRITE` (render-pass depth clear, mipmap `vkCmdBlitImage`) and `SYNC-HAZARD-READ-AFTER-WRITE` (`vkCmdCopyImageToBuffer` readback), each after a layout-transition barrier with the wrong stage. flutter-pi records none of these commands, so they come from the engine. |
+| Surface-pool EAGAIN | **14**, all 19:26:20–19:26:40, when the visible webview opened |
+| WPE frames on the GPU path | **None.** On close: `destroyed after 0 frames, 0 dropped, 0 source imports`. The screen showed nothing in the webview. |
+
+Pool dump at the first EAGAIN (1920x1200, 6 slots): every slot has
+`flutter=0`. Only slot 4 is `front=1` (refs=3). Slot 2 has refs=2, and slots 0,
+1, 3 and 5 have refs=1. So five slots are neither rendered by Flutter nor shown,
+but are still referenced: pending present, a KMS callback that has not released
+them, or a missing unref. The burst stopped by itself after 20 s.
+
+Conclusion: the shared-queue lock showed no threading error under validation,
+but the soak does not meet its goal. WPE never submitted to the shared queue,
+so the Flutter+WPE concurrency case was not exercised. Open:
+
+1. Why the visible WPE webview produced no GPU frames (0 source imports).
+2. What holds five non-front slots when a layer appears.
+3. The engine sync hazards above, for the patched-engine layout item.
+
+Rerun the soak after 1 and 2. Full log: `/tmp/soak-20261020.log` on the
+operator Mac (not durable).
+
 ## Latest status: display-plane modifier intersection (#7) fixed
 
 The window already picks the modifiers the display plane accepts for the
@@ -49,7 +84,7 @@ for implementation, provenance, concurrency tests and remaining integration limi
 **85/85 Release, 86/86 Debug, 86/86 ASan/UBSan pass**, including 17 new dispatch and
 concurrency tests. Two lock/resolver mutation checks fail as expected. A real Pi
 GPU smoke passed 20 cycles through the nested resolver. No service deployment or
-restart; real Flutter/WPE threading-validation/soak is still pending. Display-plane
+restart; the first Flutter/WPE soak (2026-10-20, above) is partial. Display-plane
 modifier intersection was open at this checkpoint; it is fixed above. Historical statements below that queue
 synchronization is unimplemented are superseded by this section.
 
