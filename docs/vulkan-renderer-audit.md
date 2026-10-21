@@ -63,8 +63,14 @@ closed 09:09:23, reopened 09:09:26 full width, with page loads in each.
 
 Result: the shared-queue sync and the 9-slot pool pass on device with Flutter
 and a visible WPE webview, including close/reopen and a changed webview
-placement. The run was just under the 1-hour target. Item 3 (engine barrier
-hazards) remains open. Full log: `/tmp/soak-20261020.log` on the
+placement. The run was just under the 1-hour target.
+
+Item 3 (engine barrier hazards) is fixed by Telosnex engine patches 0017–0019
+(`dev/flutter_pi/engine/patches/` in the app repo): readback barrier to the
+transfer stage, mipmap TransferDst barrier allowing transfer writes, and the
+render pass incoming dependency covering the depth/stencil clear. With sync
+validation on (2026-10-21, engine `c10612d9…`), startup produced none of the
+three messages in 3 minutes; before, all three appeared within ~30 s. Full log: `/tmp/soak-20261020.log` on the
 operator Mac (not durable).
 
 ## Latest status: display-plane modifier intersection (#7) fixed
