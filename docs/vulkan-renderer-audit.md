@@ -44,7 +44,27 @@ buffers = all 6 slots), so item 2 was pool sizing, not a leak. The pool is now
 9 slots. The same release sets premultiplied blend mode on every plane above
 the bottom one, which fixed a black square behind the cursor. On device, the
 webview flicker and the cursor square are both gone. Item 1 did not reproduce.
-Item 3 and the full soak rerun remain open. Full log: `/tmp/soak-20261020.log` on the
+Item 3 and the full soak rerun remain open.
+
+Soak rerun (2026-10-21, runner `telosnex/2026-10-21-0aa85f3`, Khronos
+validation with `VK_VALIDATION_VALIDATE_SYNC=1` through a temporary
+`zz-experiment.conf`, removed afterwards). One process (PID 4079553) ran
+55 min 45 s with a visible WPE webview on plane p107: opened 08:19:44, closed
+09:08:54, reopened 09:08:59 at a different placement (1745x1023 at 79,49),
+closed 09:09:23, reopened 09:09:26 full width, with page loads in each.
+
+| Check | Result |
+| --- | --- |
+| Runner restarts | 0 |
+| Validation threading errors (shared queue) | 0 |
+| `VK_ERROR_*`, device lost, fence timeouts | 0 |
+| Surface-pool EAGAIN | 0 (14 in the 2026-10-20 run with 6 slots) |
+| Other validation messages | The same 20 engine sync hazards at startup only (item 3) |
+
+Result: the shared-queue sync and the 9-slot pool pass on device with Flutter
+and a visible WPE webview, including close/reopen and a changed webview
+placement. The run was just under the 1-hour target. Item 3 (engine barrier
+hazards) remains open. Full log: `/tmp/soak-20261020.log` on the
 operator Mac (not durable).
 
 ## Latest status: display-plane modifier intersection (#7) fixed
@@ -96,7 +116,7 @@ for implementation, provenance, concurrency tests and remaining integration limi
 **85/85 Release, 86/86 Debug, 86/86 ASan/UBSan pass**, including 17 new dispatch and
 concurrency tests. Two lock/resolver mutation checks fail as expected. A real Pi
 GPU smoke passed 20 cycles through the nested resolver. No service deployment or
-restart; the first Flutter/WPE soak (2026-10-20, above) is partial. Display-plane
+restart; the Flutter/WPE soak rerun (2026-10-21, below) passed. Display-plane
 modifier intersection was open at this checkpoint; it is fixed above. Historical statements below that queue
 synchronization is unimplemented are superseded by this section.
 
