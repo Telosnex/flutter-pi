@@ -2892,17 +2892,23 @@ int kms_req_builder_push_fb_layer(
             // else: rotation requested but not enforced, or hardcoded rotation matches - silently skip setting property
         }
 
-        if (index == 0) {
-            if (plane->has_alpha) {
-                ok = drmModeAtomicAddProperty(builder->req, plane_id, plane->ids.alpha, plane->max_alpha);
-                if (ok < 0) {
-                    ok = -ok;
-                    goto fail_release_plane;
-                }
+        // Set plane alpha and blend mode on every plane, not only the bottom
+        // one. KMS keeps the last committed value, so a plane that was once
+        // the bottom layer (blend "None") would otherwise keep ignoring alpha
+        // when it is reused above it, for example for the cursor. Flutter,
+        // WebKit and the cursor all produce premultiplied alpha.
+        if (plane->has_alpha) {
+            ok = drmModeAtomicAddProperty(builder->req, plane_id, plane->ids.alpha, plane->max_alpha);
+            if (ok < 0) {
+                ok = -ok;
+                goto fail_release_plane;
             }
+        }
 
-            if (plane->has_blend_mode && plane->supported_blend_modes[kNone_DrmBlendMode]) {
-                ok = drmModeAtomicAddProperty(builder->req, plane_id, plane->ids.pixel_blend_mode, kNone_DrmBlendMode);
+        if (plane->has_blend_mode) {
+            enum drm_blend_mode blend_mode = index == 0 ? kNone_DrmBlendMode : kPremultiplied_DrmBlendMode;
+            if (plane->supported_blend_modes[blend_mode]) {
+                ok = drmModeAtomicAddProperty(builder->req, plane_id, plane->ids.pixel_blend_mode, blend_mode);
                 if (ok < 0) {
                     ok = -ok;
                     goto fail_release_plane;

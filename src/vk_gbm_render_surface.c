@@ -41,10 +41,13 @@ struct fb {
     FlutterVulkanImage fl_image;
 };
 
-// Two Flutter layers across current, pending and rendering frames. This is a
-// bounded pool, not a guarantee for arbitrary layer counts; exhaustion remains
-// a recoverable EAGAIN instead of reusing a live image.
-enum { VK_GBM_BUFFER_COUNT = 6 };
+// Three Flutter layers across current, pending and rendering frames. A visible
+// WPE webview splits Flutter into a layer below and a layer above it, and a
+// third layer appears briefly during transitions (2026-10-21 KMS trace: six
+// slots ran out at each such moment). This is a bounded pool, not a guarantee
+// for arbitrary layer counts; exhaustion remains a recoverable EAGAIN instead
+// of reusing a live image.
+enum { VK_GBM_BUFFER_COUNT = 9 };
 
 struct locked_fb {
     struct vk_gbm_render_surface *surface;

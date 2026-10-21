@@ -38,7 +38,8 @@ if(HAVE_VULKAN)
         set_property(TARGET ${target} PROPERTY INTERPROCEDURAL_OPTIMIZATION FALSE)
     endforeach()
     foreach(case atomic_plane_without_fence_must_not_silently_accept legacy_path_must_not_discard_explicit_fence
-            failed_fence_property_must_fail_layer_submission supported_plane_receives_fence_and_retains_fd)
+            failed_fence_property_must_fail_layer_submission supported_plane_receives_fence_and_retains_fd
+            upper_planes_get_premultiplied_blend_mode)
         add_test(NAME vulkan_audit.${case} COMMAND vulkan_kms_audit_test ${case})
         set_tests_properties(vulkan_audit.${case} PROPERTIES LABELS vulkan-audit TIMEOUT 10)
     endforeach()

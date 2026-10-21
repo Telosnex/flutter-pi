@@ -11,7 +11,9 @@ static struct drm_plane plane;
 static struct drm_crtc crtc;
 static struct drmdev dev;
 static struct kms_req_builder builder;
+static struct drm_plane planes[2];
 static int fence_fd, fence_properties, reject_property, releases, atomic_cursor;
+static int64_t blend_values[2];
 int drmModeAtomicGetCursor(drmModeAtomicReq *req) {
     (void) req;
     return atomic_cursor;
@@ -21,10 +23,13 @@ void drmModeAtomicSetCursor(drmModeAtomicReq *req, int cursor) {
     atomic_cursor = cursor;
 }
 #define FENCE_PROPERTY 77
+#define BLEND_PROPERTY_BASE 90
 int drmModeAtomicAddProperty(drmModeAtomicReq *req, uint32_t object, uint32_t property, uint64_t value) {
     (void) req;
     (void) object;
-    (void) value;
+    if (property >= BLEND_PROPERTY_BASE && property < BLEND_PROPERTY_BASE + 2) {
+        blend_values[property - BLEND_PROPERTY_BASE] = (int64_t) value;
+    }
     if (property == FENCE_PROPERTY) {
         if (reject_property)
             return -ENOMEM;
@@ -49,6 +54,7 @@ void setUp(void) {
     fence_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     TEST_ASSERT_GREATER_OR_EQUAL_INT(0, fence_fd);
     fence_properties = reject_property = releases = 0;
+    blend_values[0] = blend_values[1] = -1;
     atomic_cursor = 5;
 }
 void tearDown(void) {
@@ -99,6 +105,35 @@ static void failed_property_rolls_back_request_plane_and_caller_ownership(void) 
     reject_property = 0;
     TEST_ASSERT_EQUAL_INT(0, push());
 }
+static int push_plain(void) {
+    struct kms_fb_layer layer = { .drm_fb_id = 42,
+                                  .format = PIXFMT_ARGB8888,
+                                  .dst_w = 64,
+                                  .dst_h = 64,
+                                  .src_w = 64u << 16,
+                                  .src_h = 64u << 16 };
+    return kms_req_builder_push_fb_layer(&builder, &layer, release, NULL, NULL, NULL);
+}
+static void upper_planes_get_premultiplied_blend_mode(void) {
+    // Two planes that both support every blend mode. The bottom layer must be
+    // opaque ("None"). Every layer above it, including the cursor, must be set
+    // to premultiplied explicitly, because KMS keeps a plane's last value.
+    for (int i = 0; i < 2; i++) {
+        planes[i] = (struct drm_plane) { .id = 20 + i, .type = i == 0 ? kPrimary_DrmPlaneType : kOverlay_DrmPlaneType };
+        planes[i].supported_formats[PIXFMT_ARGB8888] = true;
+        planes[i].has_blend_mode = true;
+        planes[i].ids.pixel_blend_mode = BLEND_PROPERTY_BASE + i;
+        planes[i].ids.in_fence_fd = DRM_ID_NONE;
+        for (int m = 0; m < kCount_DrmBlendMode; m++)
+            planes[i].supported_blend_modes[m] = true;
+    }
+    dev = (struct drmdev) { .n_planes = 2, .planes = planes };
+    BITSET_SET(builder.available_planes, 1);
+    TEST_ASSERT_EQUAL_INT(0, push_plain());
+    TEST_ASSERT_EQUAL_INT(0, push_plain());
+    TEST_ASSERT_EQUAL_INT64(kNone_DrmBlendMode, blend_values[0]);
+    TEST_ASSERT_EQUAL_INT64(kPremultiplied_DrmBlendMode, blend_values[1]);
+}
 int main(int argc, char **argv) {
     UNITY_BEGIN();
     int selected = 0;
@@ -112,5 +147,6 @@ int main(int argc, char **argv) {
     CASE(legacy_path_must_not_discard_explicit_fence)
     CASE(failed_fence_property_must_fail_layer_submission)
     CASE(supported_plane_receives_fence_and_retains_fd)
+    CASE(upper_planes_get_premultiplied_blend_mode)
     return selected ? UNITY_END() : 2;
 }
