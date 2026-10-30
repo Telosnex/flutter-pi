@@ -883,7 +883,7 @@ int webview_direct_resize(struct webview_direct *view, int width, int height) {
     return 0;
 }
 
-enum page_task_type { kLoadUrl, kLoadBytes, kRunJavaScript };
+enum page_task_type { kLoadUrl, kLoadBytes, kRunJavaScript, kAddUserScript };
 
 struct page_task {
     struct webview_direct *view;
@@ -908,6 +908,21 @@ static gboolean run_page_task(void *userdata) {
         case kLoadUrl: webkit_web_view_load_uri(web_view, task->string); break;
         case kLoadBytes: webkit_web_view_load_bytes(web_view, task->bytes, NULL, NULL, NULL); break;
         case kRunJavaScript: webkit_web_view_evaluate_javascript(web_view, task->string, -1, NULL, NULL, NULL, NULL, NULL); break;
+        case kAddUserScript: {
+            WebKitUserContentManager *manager = webkit_web_view_get_user_content_manager(web_view);
+            WebKitUserScript *script;
+            if (manager == NULL) break;
+            script = webkit_user_script_new(
+                task->string,
+                WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES,
+                WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START,
+                NULL,
+                NULL
+            );
+            webkit_user_content_manager_add_script(manager, script);
+            webkit_user_script_unref(script);
+            break;
+        }
     }
     return G_SOURCE_REMOVE;
 }
@@ -932,6 +947,10 @@ int webview_direct_load_bytes(struct webview_direct *view, const uint8_t *data, 
 
 int webview_direct_run_javascript(struct webview_direct *view, const char *source) {
     return queue_page_task(view, kRunJavaScript, g_strdup(source), NULL);
+}
+
+int webview_direct_add_user_script(struct webview_direct *view, const char *source) {
+    return queue_page_task(view, kAddUserScript, g_strdup(source), NULL);
 }
 
 /* ------------------------------------------------------------------------- */

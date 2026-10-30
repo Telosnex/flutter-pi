@@ -413,13 +413,49 @@ static enum listener_return on_web_event_notify(void *arg, void *userdata) {
         case kGstplayerWebHistoryChanged:
             platch_send_success_event_std(
                 meta->event_channel_name,
-                &STDMAP3(
+                &STDMAP4(
                     STDSTRING("event"),
                     STDSTRING("webHistoryChanged"),
                     STDSTRING("canGoBack"),
                     STDBOOL(event->can_go_back),
                     STDSTRING("canGoForward"),
-                    STDBOOL(event->can_go_forward)
+                    STDBOOL(event->can_go_forward),
+                    STDSTRING("url"),
+                    event->url == NULL ? STDNULL : STDSTRING(event->url)
+                )
+            );
+            break;
+        case kGstplayerWebLoadCommitted:
+            platch_send_success_event_std(
+                meta->event_channel_name,
+                &STDMAP2(
+                    STDSTRING("event"),
+                    STDSTRING("webLoadCommitted"),
+                    STDSTRING("url"),
+                    event->url == NULL ? STDNULL : STDSTRING(event->url)
+                )
+            );
+            break;
+        case kGstplayerWebNavigationAction:
+            platch_send_success_event_std(
+                meta->event_channel_name,
+                &STDMAP8(
+                    STDSTRING("event"),
+                    STDSTRING("webNavigationAction"),
+                    STDSTRING("callId"),
+                    STDINT64(event->call_id),
+                    STDSTRING("url"),
+                    STDSTRING(event->url == NULL ? "" : event->url),
+                    STDSTRING("method"),
+                    STDSTRING(event->message == NULL ? "GET" : event->message),
+                    STDSTRING("hasGesture"),
+                    STDBOOL(event->has_gesture),
+                    STDSTRING("isRedirect"),
+                    STDBOOL(event->is_redirect),
+                    STDSTRING("isNewWindow"),
+                    STDBOOL(event->is_new_window),
+                    STDSTRING("navigationType"),
+                    STDINT64(event->navigation_type)
                 )
             );
             break;
@@ -1948,6 +1984,64 @@ static int on_web_handler_response_v2(
     return platch_respond_success_std(responsehandle, &STDNULL);
 }
 
+static bool raw_std_value_as_strict_bool(const struct raw_std_value *value, bool *out) {
+    if (raw_std_value_is_true(value)) {
+        *out = true;
+        return true;
+    }
+    if (raw_std_value_is_false(value)) {
+        *out = false;
+        return true;
+    }
+    return false;
+}
+
+/// webSetDelegates: [textureId, navigation, console].
+static int on_web_set_delegates_v2(
+    const struct raw_std_value *arg,
+    FlutterPlatformMessageResponseHandle *responsehandle
+) {
+    struct gstplayer *player;
+    bool navigation, console;
+    int ok;
+
+    ok = check_arg_is_minimum_sized_list(arg, 3, responsehandle);
+    if (ok != 0) return 0;
+    player = get_player_from_v2_list_arg(arg, responsehandle);
+    if (player == NULL) return 0;
+    if (!raw_std_value_as_strict_bool(raw_std_list_get_nth_element(arg, 1), &navigation) ||
+        !raw_std_value_as_strict_bool(raw_std_list_get_nth_element(arg, 2), &console)) {
+        return platch_respond_illegal_arg_std(responsehandle, "Expected [int, bool, bool].");
+    }
+    ok = gstplayer_web_set_delegates(player, navigation, console);
+    if (ok != 0) return platch_respond_native_error_std(responsehandle, ok);
+    return platch_respond_success_std(responsehandle, &STDNULL);
+}
+
+/// webNavigationResponse: [textureId, callId, allow].
+static int on_web_navigation_response_v2(
+    const struct raw_std_value *arg,
+    FlutterPlatformMessageResponseHandle *responsehandle
+) {
+    const struct raw_std_value *call_id_value;
+    struct gstplayer *player;
+    bool allow;
+    int ok;
+
+    ok = check_arg_is_minimum_sized_list(arg, 3, responsehandle);
+    if (ok != 0) return 0;
+    player = get_player_from_v2_list_arg(arg, responsehandle);
+    if (player == NULL) return 0;
+    call_id_value = raw_std_list_get_nth_element(arg, 1);
+    if (!raw_std_value_is_int(call_id_value) ||
+        !raw_std_value_as_strict_bool(raw_std_list_get_nth_element(arg, 2), &allow)) {
+        return platch_respond_illegal_arg_std(responsehandle, "Expected [int, int, bool].");
+    }
+    ok = gstplayer_web_respond_to_navigation(player, raw_std_value_as_int(call_id_value), allow);
+    if (ok != 0) return platch_respond_native_error_std(responsehandle, ok);
+    return platch_respond_success_std(responsehandle, &STDNULL);
+}
+
 static int on_step_backward_v2(const struct raw_std_value *arg, FlutterPlatformMessageResponseHandle *responsehandle) {
     struct gstplayer *player;
     int ok;
@@ -2028,6 +2122,10 @@ static int on_receive_method_channel_v2(char *channel, struct platch_obj *object
         return on_web_run_javascript_v2(arg, responsehandle);
     } else if (raw_std_string_equals(method, "webHandlerResponse")) {
         return on_web_handler_response_v2(arg, responsehandle);
+    } else if (raw_std_string_equals(method, "webSetDelegates")) {
+        return on_web_set_delegates_v2(arg, responsehandle);
+    } else if (raw_std_string_equals(method, "webNavigationResponse")) {
+        return on_web_navigation_response_v2(arg, responsehandle);
     } else {
         return platch_respond_not_implemented(responsehandle);
     }

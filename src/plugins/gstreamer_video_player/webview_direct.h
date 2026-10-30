@@ -52,6 +52,9 @@ void webview_direct_destroy(struct webview_direct *view);
 int webview_direct_load_url(struct webview_direct *view, const char *url);
 int webview_direct_load_bytes(struct webview_direct *view, const uint8_t *data, size_t size);
 int webview_direct_run_javascript(struct webview_direct *view, const char *source);
+/// Adds a document-start script for all frames. It applies to documents loaded
+/// afterwards, not the current one.
+int webview_direct_add_user_script(struct webview_direct *view, const char *source);
 /// Resizes the existing document on the WebKit thread; no reload or new view.
 /// Queued work is dropped safely after close. Dimensions must be 1..4096.
 int webview_direct_resize(struct webview_direct *view, int width, int height);
