@@ -410,6 +410,19 @@ static enum listener_return on_web_event_notify(void *arg, void *userdata) {
                 )
             );
             break;
+        case kGstplayerWebHistoryChanged:
+            platch_send_success_event_std(
+                meta->event_channel_name,
+                &STDMAP3(
+                    STDSTRING("event"),
+                    STDSTRING("webHistoryChanged"),
+                    STDSTRING("canGoBack"),
+                    STDBOOL(event->can_go_back),
+                    STDSTRING("canGoForward"),
+                    STDBOOL(event->can_go_forward)
+                )
+            );
+            break;
         case kGstplayerWebJavaScriptMessage:
             platch_send_success_event_std(
                 meta->event_channel_name,

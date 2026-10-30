@@ -68,11 +68,14 @@ enum gstplayer_web_event_type {
     kGstplayerWebLoadError,
     kGstplayerWebHandlerCall,
     kGstplayerWebJavaScriptMessage,
+    kGstplayerWebHistoryChanged,
 };
 
 struct gstplayer_web_event {
     enum gstplayer_web_event_type type;
     uint32_t call_id;
+    bool can_go_back;
+    bool can_go_forward;
     char *url;
     char *message;
 };

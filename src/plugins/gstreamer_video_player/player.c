@@ -288,6 +288,28 @@ static void notify_web_event(
     notifier_notify(&player->web_event_notifier, event);
 }
 
+// Runs only on the WebKit thread. The list includes same-document navigation
+// and current-item changes, unlike JavaScript history.length.
+static void notify_web_history(struct gstplayer *player, WebKitBackForwardList *list) {
+    struct gstplayer_web_event *event = calloc(1, sizeof(*event));
+    if (event == NULL) return;
+    event->type = kGstplayerWebHistoryChanged;
+    event->can_go_back = webkit_back_forward_list_get_back_item(list) != NULL;
+    event->can_go_forward = webkit_back_forward_list_get_forward_item(list) != NULL;
+    notifier_notify(&player->web_event_notifier, event);
+}
+
+static void on_web_history_changed(
+    WebKitBackForwardList *list,
+    WebKitBackForwardListItem *item_added,
+    GList *items_removed,
+    void *userdata
+) {
+    (void) item_added;
+    (void) items_removed;
+    notify_web_history(userdata, list);
+}
+
 static void on_web_load_changed(WebKitWebView *webview, WebKitLoadEvent load_event, void *userdata) {
     struct gstplayer *player = userdata;
     const char *url = webkit_web_view_get_uri(webview);
@@ -387,6 +409,11 @@ static void on_configure_web_view(GObject *object, void *userdata) {
         return;
     }
 
+    // webview_direct_destroy disconnects this handler on this thread before
+    // the player userdata is released.
+    WebKitBackForwardList *history = webkit_web_view_get_back_forward_list(webview);
+    g_signal_connect(history, "changed", G_CALLBACK(on_web_history_changed), player);
+    notify_web_history(player, history);
     g_signal_connect(webview, "load-changed", G_CALLBACK(on_web_load_changed), player);
     g_signal_connect(webview, "load-failed", G_CALLBACK(on_web_load_failed), player);
     g_signal_connect(

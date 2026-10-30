@@ -820,8 +820,11 @@ static gboolean destroy_on_thread(void *userdata) {
     finish_waiting_frame(view);
     manager = webkit_web_view_get_user_content_manager(web_view);
     if (view->userdata != NULL) {
+        WebKitBackForwardList *history = webkit_web_view_get_back_forward_list(web_view);
         g_signal_handlers_disconnect_by_data(web_view, view->userdata);
         if (manager != NULL) g_signal_handlers_disconnect_by_data(manager, view->userdata);
+        // WebKit can keep the list alive past the view's last unref.
+        if (history != NULL) g_signal_handlers_disconnect_by_data(history, view->userdata);
     }
 
     LOG_STATS(
