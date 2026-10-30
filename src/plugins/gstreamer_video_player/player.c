@@ -211,7 +211,11 @@ struct gstplayer {
 
     GMutex web_lock;
     GHashTable *pending_web_replies;
+    /// call_id -> struct pending_web_decision. Guarded by web_lock.
+    GHashTable *pending_web_decisions;
     uint32_t next_web_call_id;
+    /// Set from the platform thread, read on the WebKit thread.
+    gint web_navigation_delegate;
     sd_event_source *busfd_events;
 
     bool is_live;
@@ -229,6 +233,17 @@ struct web_reply_task {
     char *error;
 };
 
+/// A navigation that waits for the app. WebKit objects are used and released
+/// only on the WebKit thread (@main_context).
+struct pending_web_decision {
+    WebKitPolicyDecision *decision;
+    GMainContext *main_context;
+    /// New-window requests only: the URL to load in this view if allowed.
+    char *new_window_uri;
+    struct gstplayer *player;
+    bool allow;
+};
+
 static gboolean complete_web_reply(void *userdata);
 
 static const char kWebBridgeScript[] =
@@ -244,6 +259,61 @@ static const char kWebBridgeScript[] =
     "}"
     "});"
     "})();";
+
+/// Forwards console calls as {"type":"console"} messages on the existing
+/// telosnexEvents channel. Installed only when the app asks for console
+/// messages, so pages that log heavily cost nothing otherwise.
+static const char kWebConsoleScript[] =
+    "(() => {"
+    "const post = window.webkit && window.webkit.messageHandlers &&"
+    " window.webkit.messageHandlers.telosnexEvents;"
+    "if (!post || console.__telosnexForwarded) return;"
+    "const text = (value) => {"
+    "if (typeof value === 'string') return value;"
+    "try { const json = JSON.stringify(value); return json === undefined ? String(value) : json; }"
+    "catch (_) { return String(value); }"
+    "};"
+    "for (const level of ['log', 'debug', 'info', 'warn', 'error']) {"
+    "const original = console[level];"
+    "console[level] = function (...args) {"
+    "try {"
+    "post.postMessage(JSON.stringify({type: 'console', level,"
+    " message: args.map(text).join(' ').slice(0, 10000)}));"
+    "} catch (_) {}"
+    "return original.apply(this, args);"
+    "};"
+    "}"
+    "Object.defineProperty(console, '__telosnexForwarded', {value: true});"
+    "})();";
+
+static gboolean finish_web_decision(void *userdata) {
+    struct pending_web_decision *pending = userdata;
+    if (pending->new_window_uri != NULL) {
+        // WebKit cannot open a second window here; load it in this view.
+        webkit_policy_decision_ignore(pending->decision);
+        if (pending->allow && pending->player != NULL) {
+            gstplayer_web_load_url(pending->player, pending->new_window_uri);
+        }
+    } else if (pending->allow) {
+        webkit_policy_decision_use(pending->decision);
+    } else {
+        webkit_policy_decision_ignore(pending->decision);
+    }
+    g_object_unref(pending->decision);
+    g_main_context_unref(pending->main_context);
+    g_free(pending->new_window_uri);
+    free(pending);
+    return G_SOURCE_REMOVE;
+}
+
+/// Hash table destructor: the view is closing, so ignore the navigation.
+static void destroy_pending_web_decision(void *value) {
+    struct pending_web_decision *pending = value;
+    if (pending == NULL) return;
+    pending->allow = false;
+    pending->player = NULL;
+    g_main_context_invoke(pending->main_context, finish_web_decision, pending);
+}
 
 static void destroy_web_event(void *value) {
     struct gstplayer_web_event *event = value;
@@ -288,11 +358,126 @@ static void notify_web_event(
     notifier_notify(&player->web_event_notifier, event);
 }
 
+// Runs only on the WebKit thread. The list includes same-document navigation
+// and current-item changes, unlike JavaScript history.length. @url is the
+// current page, so the app can follow pushState/hash changes, which have no
+// load events.
+static void notify_web_history(struct gstplayer *player, WebKitBackForwardList *list, const char *url) {
+    struct gstplayer_web_event *event = calloc(1, sizeof(*event));
+    if (event == NULL) return;
+    event->type = kGstplayerWebHistoryChanged;
+    event->can_go_back = webkit_back_forward_list_get_back_item(list) != NULL;
+    event->can_go_forward = webkit_back_forward_list_get_forward_item(list) != NULL;
+    event->url = url == NULL ? NULL : strdup(url);
+    if (url != NULL && event->url == NULL) {
+        free(event);
+        return;
+    }
+    notifier_notify(&player->web_event_notifier, event);
+}
+
+static void on_web_history_changed(
+    WebKitBackForwardList *list,
+    WebKitBackForwardListItem *item_added,
+    GList *items_removed,
+    void *userdata
+) {
+    WebKitBackForwardListItem *current = webkit_back_forward_list_get_current_item(list);
+    (void) item_added;
+    (void) items_removed;
+    notify_web_history(userdata, list, current == NULL ? NULL : webkit_back_forward_list_item_get_uri(current));
+}
+
+// Covers same-document URL changes that do not touch the list
+// (history.replaceState). During a load the URI is provisional; the list
+// change at commit reports the final one.
+static void on_web_uri_changed(GObject *object, GParamSpec *pspec, void *userdata) {
+    WebKitWebView *webview = WEBKIT_WEB_VIEW(object);
+    (void) pspec;
+    if (webkit_web_view_is_loading(webview)) return;
+    notify_web_history(userdata, webkit_web_view_get_back_forward_list(webview), webkit_web_view_get_uri(webview));
+}
+
+static void on_web_process_terminated(WebKitWebView *webview, WebKitWebProcessTerminationReason reason, void *userdata) {
+    const char *message;
+    if (reason == WEBKIT_WEB_PROCESS_TERMINATED_BY_API) return;
+    message = reason == WEBKIT_WEB_PROCESS_EXCEEDED_MEMORY_LIMIT ? "The web page used too much memory and was stopped."
+                                                                   : "The web page process crashed.";
+    LOG_ERROR("WPE web process terminated: %s\n", message);
+    notify_web_event(userdata, kGstplayerWebLoadError, 0, webkit_web_view_get_uri(webview), message);
+}
+
+static gboolean on_web_decide_policy(
+    WebKitWebView *webview,
+    WebKitPolicyDecision *decision,
+    WebKitPolicyDecisionType type,
+    void *userdata
+) {
+    struct gstplayer *player = userdata;
+    struct pending_web_decision *pending;
+    struct gstplayer_web_event *event;
+    WebKitNavigationAction *action;
+    WebKitURIRequest *request;
+    GMainContext *main_context;
+    const char *uri, *method;
+    uint32_t call_id;
+    (void) webview;
+
+    if (!g_atomic_int_get(&player->web_navigation_delegate)) return FALSE;
+    if (type != WEBKIT_POLICY_DECISION_TYPE_NAVIGATION_ACTION && type != WEBKIT_POLICY_DECISION_TYPE_NEW_WINDOW_ACTION) {
+        return FALSE;
+    }
+    main_context = g_main_context_get_thread_default();
+    if (main_context == NULL) return FALSE;
+
+    action = webkit_navigation_policy_decision_get_navigation_action(WEBKIT_NAVIGATION_POLICY_DECISION(decision));
+    request = webkit_navigation_action_get_request(action);
+    uri = webkit_uri_request_get_uri(request);
+    method = webkit_uri_request_get_http_method(request);
+
+    event = calloc(1, sizeof(*event));
+    pending = calloc(1, sizeof(*pending));
+    if (event == NULL || pending == NULL) {
+        free(event);
+        free(pending);
+        return FALSE;
+    }
+    event->type = kGstplayerWebNavigationAction;
+    event->url = strdup(uri == NULL ? "" : uri);
+    event->message = strdup(method == NULL ? "GET" : method);
+    event->has_gesture = webkit_navigation_action_is_user_gesture(action);
+    event->is_redirect = webkit_navigation_action_is_redirect(action);
+    event->is_new_window = type == WEBKIT_POLICY_DECISION_TYPE_NEW_WINDOW_ACTION;
+    event->navigation_type = (int) webkit_navigation_action_get_navigation_type(action);
+    if (event->is_new_window) pending->new_window_uri = g_strdup(uri == NULL ? "" : uri);
+    if (event->url == NULL || event->message == NULL) {
+        destroy_web_event(event);
+        g_free(pending->new_window_uri);
+        free(pending);
+        return FALSE;
+    }
+    pending->decision = WEBKIT_POLICY_DECISION(g_object_ref(decision));
+    pending->main_context = g_main_context_ref(main_context);
+    pending->player = player;
+
+    g_mutex_lock(&player->web_lock);
+    call_id = player->next_web_call_id++;
+    if (call_id == 0) call_id = player->next_web_call_id++;
+    g_hash_table_insert(player->pending_web_decisions, GUINT_TO_POINTER(call_id), pending);
+    g_mutex_unlock(&player->web_lock);
+
+    event->call_id = call_id;
+    notifier_notify(&player->web_event_notifier, event);
+    return TRUE;
+}
+
 static void on_web_load_changed(WebKitWebView *webview, WebKitLoadEvent load_event, void *userdata) {
     struct gstplayer *player = userdata;
     const char *url = webkit_web_view_get_uri(webview);
     if (load_event == WEBKIT_LOAD_STARTED) {
         notify_web_event(player, kGstplayerWebLoadStart, 0, url, NULL);
+    } else if (load_event == WEBKIT_LOAD_COMMITTED) {
+        notify_web_event(player, kGstplayerWebLoadCommitted, 0, url, NULL);
     } else if (load_event == WEBKIT_LOAD_FINISHED) {
         notify_web_event(player, kGstplayerWebLoadStop, 0, url, NULL);
     }
@@ -387,8 +572,16 @@ static void on_configure_web_view(GObject *object, void *userdata) {
         return;
     }
 
+    // webview_direct_destroy disconnects this handler on this thread before
+    // the player userdata is released.
+    WebKitBackForwardList *history = webkit_web_view_get_back_forward_list(webview);
+    g_signal_connect(history, "changed", G_CALLBACK(on_web_history_changed), player);
+    notify_web_history(player, history, NULL);
     g_signal_connect(webview, "load-changed", G_CALLBACK(on_web_load_changed), player);
     g_signal_connect(webview, "load-failed", G_CALLBACK(on_web_load_failed), player);
+    g_signal_connect(webview, "notify::uri", G_CALLBACK(on_web_uri_changed), player);
+    g_signal_connect(webview, "web-process-terminated", G_CALLBACK(on_web_process_terminated), player);
+    g_signal_connect(webview, "decide-policy", G_CALLBACK(on_web_decide_policy), player);
     g_signal_connect(
         manager,
         "script-message-with-reply-received::telosnex",
@@ -1462,6 +1655,7 @@ static struct gstplayer *gstplayer_new(
 
     g_mutex_init(&player->web_lock);
     player->pending_web_replies = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, destroy_pending_web_reply);
+    player->pending_web_decisions = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, destroy_pending_web_decision);
     if (player->pending_web_replies == NULL)
         goto fail_deinit_web_resources;
 
@@ -1629,6 +1823,7 @@ void gstplayer_destroy(struct gstplayer *player) {
     notifier_deinit(&player->error_notifier);
     notifier_deinit(&player->web_event_notifier);
     g_hash_table_unref(player->pending_web_replies);
+    g_hash_table_unref(player->pending_web_decisions);
     g_mutex_clear(&player->web_lock);
     pthread_mutex_destroy(&player->lock);
     if (player->headers != NULL) {
@@ -1846,6 +2041,28 @@ int gstplayer_web_respond_to_handler(
 
     task->pending = pending;
     g_main_context_invoke(pending->main_context, complete_web_reply, task);
+    return 0;
+}
+
+int gstplayer_web_set_delegates(struct gstplayer *player, bool navigation, bool console) {
+    ASSERT_NOT_NULL(player);
+    if (player->webview_direct == NULL) return EOPNOTSUPP;
+    g_atomic_int_set(&player->web_navigation_delegate, navigation ? 1 : 0);
+    if (console) return webview_direct_add_user_script(player->webview_direct, kWebConsoleScript);
+    return 0;
+}
+
+int gstplayer_web_respond_to_navigation(struct gstplayer *player, uint32_t call_id, bool allow) {
+    struct pending_web_decision *pending;
+
+    ASSERT_NOT_NULL(player);
+    g_mutex_lock(&player->web_lock);
+    pending = g_hash_table_lookup(player->pending_web_decisions, GUINT_TO_POINTER(call_id));
+    if (pending != NULL) g_hash_table_steal(player->pending_web_decisions, GUINT_TO_POINTER(call_id));
+    g_mutex_unlock(&player->web_lock);
+    if (pending == NULL) return ENOENT;
+    pending->allow = allow;
+    g_main_context_invoke(pending->main_context, finish_web_decision, pending);
     return 0;
 }
 

@@ -68,12 +68,23 @@ enum gstplayer_web_event_type {
     kGstplayerWebLoadError,
     kGstplayerWebHandlerCall,
     kGstplayerWebJavaScriptMessage,
+    kGstplayerWebHistoryChanged,
+    kGstplayerWebLoadCommitted,
+    kGstplayerWebNavigationAction,
 };
 
 struct gstplayer_web_event {
     enum gstplayer_web_event_type type;
     uint32_t call_id;
+    bool can_go_back;
+    bool can_go_forward;
+    /// kGstplayerWebNavigationAction only.
+    bool has_gesture;
+    bool is_redirect;
+    bool is_new_window;
+    int navigation_type;
     char *url;
+    /// The HTTP method for kGstplayerWebNavigationAction.
     char *message;
 };
 
@@ -206,6 +217,16 @@ int gstplayer_web_respond_to_handler(
     const char *result_json,
     const char *error
 );
+
+/// Opts in to callbacks that need the app's cooperation. With @navigation,
+/// every navigation and new-window request waits for
+/// gstplayer_web_respond_to_navigation(). With @console, documents loaded
+/// afterwards post console calls as {"type":"console"} JavaScript messages.
+int gstplayer_web_set_delegates(struct gstplayer *player, bool navigation, bool console);
+
+/// Completes a kGstplayerWebNavigationAction. An allowed new-window request
+/// loads in this view.
+int gstplayer_web_respond_to_navigation(struct gstplayer *player, uint32_t call_id, bool allow);
 
 /// WebKit lifecycle, JavaScript-message, and handler events.
 struct notifier *gstplayer_get_web_event_notifier(struct gstplayer *player);
